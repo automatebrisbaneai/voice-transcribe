@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Voice Transcribe</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f0f4f8;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .container {
+            width: 100%;
+            max-width: 480px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        h1 {
+            text-align: center;
+            font-size: 1.3rem;
+            color: #1e293b;
+            font-weight: 600;
+        }
+        #recordBtn {
+            width: 100%;
+            padding: 28px;
+            font-size: 1.25rem;
+            font-weight: 700;
+            border: none;
+            border-radius: 16px;
+            cursor: pointer;
+            background: #2563eb;
+            color: white;
+            transition: background 0.15s, transform 0.1s;
+            -webkit-tap-highlight-color: transparent;
+        }
+        #recordBtn:active { transform: scale(0.97); }
+        #recordBtn.recording { background: #dc2626; }
+        #recordBtn:disabled { background: #94a3b8; cursor: not-allowed; }
+
+        #status {
+            text-align: center;
+            color: #64748b;
+            font-size: 0.9rem;
+            min-height: 22px;
+        }
+        #interim {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 14px;
+            min-height: 80px;
+            font-size: 0.95rem;
+            color: #94a3b8;
+            display: none;
+            line-height: 1.5;
+        }
+        #resultArea { display: none; flex-direction: column; gap: 12px; }
+        #cleanedText {
+            width: 100%;
+            min-height: 130px;
+            padding: 14px;
+            font-size: 0.95rem;
+            line-height: 1.6;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            resize: vertical;
+            font-family: inherit;
+            background: white;
+            color: #1e293b;
+        }
+        #cleanedText:focus { outline: 2px solid #2563eb; border-color: transparent; }
+        .actions { display: flex; gap: 10px; }
+        .actions button {
+            flex: 1;
+            padding: 16px;
+            font-size: 1rem;
+            font-weight: 600;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+        }
+        #copyBtn { background: #16a34a; color: white; }
+        #copyBtn.copied { background: #166534; }
+        #clearBtn { background: #e2e8f0; color: #475569; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Voice Transcribe</h1>
+        <button id="recordBtn">Tap to Record</button>
+        <div id="status"></div>
+        <div id="interim"></div>
+        <div id="resultArea">
+            <textarea id="cleanedText"></textarea>
+            <div class="actions">
+                <button id="copyBtn">Copy</button>
+                <button id="clearBtn">Start Over</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const recordBtn = document.getElementById('recordBtn');
+        const statusEl = document.getElementById('status');
+        const interimEl = document.getElementById('interim');
+        const resultArea = document.getElementById('resultArea');
+        const cleanedText = document.getElementById('cleanedText');
+        const copyBtn = document.getElementById('copyBtn');
+        const clearBtn = document.getElementById('clearBtn');
+
+        let recognition = null;
+        let isRecording = false;
+        let finalTranscript = '';
+
+        function initRecognition() {
+            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SR) {
+                statusEl.textContent = 'Speech recognition not supported. Use Chrome or Safari.';
+                recordBtn.disabled = true;
+                return false;
+            }
+            recognition = new SR();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'en-AU';
+
+            recognition.onresult = (event) => {
+                let interim = '';
+                finalTranscript = '';
+                for (let i = 0; i < event.results.length; i++) {
+                    if (event.results[i].isFinal) {
+                        finalTranscript += event.results[i][0].transcript + ' ';
+                    } else {
+                        interim += event.results[i][0].transcript;
+                    }
+                }
+                interimEl.textContent = finalTranscript + interim;
+            };
+
+            recognition.onerror = (e) => {
+                if (e.error === 'no-speech') return;
+                statusEl.textContent = 'Error: ' + e.error;
+                stopRecording(false);
+            };
+
+            recognition.onend = () => {
+                if (isRecording) recognition.start();
+            };
+
+            return true;
+        }
+
+        function startRecording() {
+            if (!recognition && !initRecognition()) return;
+            finalTranscript = '';
+            isRecording = true;
+            recordBtn.textContent = 'Tap to Stop';
+            recordBtn.classList.add('recording');
+            statusEl.textContent = 'Listening...';
+            interimEl.style.display = 'block';
+            interimEl.textContent = '';
+            resultArea.style.display = 'none';
+            recognition.start();
+        }
+
+        function stopRecording(clean = true) {
+            isRecording = false;
+            if (recognition) recognition.stop();
+            recordBtn.textContent = 'Tap to Record';
+            recordBtn.classList.remove('recording');
+
+            if (clean && finalTranscript.trim()) {
+                cleanTranscript(finalTranscript.trim());
+            } else if (clean) {
+                statusEl.textContent = 'Nothing recorded. Try again.';
+                interimEl.style.display = 'none';
+            }
+        }
+
+        async function cleanTranscript(text) {
+            statusEl.textContent = 'Cleaning up...';
+            recordBtn.disabled = true;
+
+            try {
+                const res = await fetch('/clean', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
+                const data = await res.json();
+                cleanedText.value = data.cleaned;
+                resultArea.style.display = 'flex';
+                interimEl.style.display = 'none';
+                statusEl.textContent = 'Edit if needed, then copy.';
+            } catch {
+                statusEl.textContent = 'Cleanup failed — raw text shown.';
+                cleanedText.value = text;
+                resultArea.style.display = 'flex';
+                interimEl.style.display = 'none';
+            } finally {
+                recordBtn.disabled = false;
+            }
+        }
+
+        recordBtn.addEventListener('click', () => {
+            isRecording ? stopRecording() : startRecording();
+        });
+
+        copyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(cleanedText.value).then(() => {
+                copyBtn.textContent = 'Copied!';
+                copyBtn.classList.add('copied');
+                setTimeout(() => {
+                    copyBtn.textContent = 'Copy';
+                    copyBtn.classList.remove('copied');
+                }, 2000);
+            });
+        });
+
+        clearBtn.addEventListener('click', () => {
+            resultArea.style.display = 'none';
+            interimEl.style.display = 'none';
+            statusEl.textContent = '';
+            finalTranscript = '';
+        });
+    </script>
+</body>
+</html>
