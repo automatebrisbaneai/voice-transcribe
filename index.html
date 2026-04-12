@@ -133,6 +133,8 @@
         let recognition = null;
         let isRecording = false;
         let finalTranscript = '';
+        let accumulatedTranscript = ''; // persists across Android recognition restarts
+        let sessionFinal = '';          // finals from current recognition session
 
         function initRecognition() {
             const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -148,14 +150,15 @@
 
             recognition.onresult = (event) => {
                 let interim = '';
-                finalTranscript = '';
+                sessionFinal = '';
                 for (let i = 0; i < event.results.length; i++) {
                     if (event.results[i].isFinal) {
-                        finalTranscript += event.results[i][0].transcript + ' ';
+                        sessionFinal += event.results[i][0].transcript + ' ';
                     } else {
                         interim += event.results[i][0].transcript;
                     }
                 }
+                finalTranscript = accumulatedTranscript + sessionFinal;
                 setInterimText(finalTranscript + interim);
             };
 
@@ -166,7 +169,12 @@
             };
 
             recognition.onend = () => {
-                if (isRecording) recognition.start();
+                if (isRecording) {
+                    // Save this session's finals before Android restarts recognition
+                    accumulatedTranscript += sessionFinal;
+                    sessionFinal = '';
+                    recognition.start();
+                }
             };
 
             return true;
@@ -175,6 +183,8 @@
         function startRecording() {
             if (!recognition && !initRecognition()) return;
             finalTranscript = '';
+            accumulatedTranscript = '';
+            sessionFinal = '';
             isRecording = true;
             recordBtn.textContent = 'Tap to Stop';
             recordBtn.classList.add('recording');
