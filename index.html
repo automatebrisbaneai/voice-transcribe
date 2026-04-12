@@ -135,6 +135,17 @@
         let finalTranscript = '';
         let accumulatedTranscript = ''; // persists across Android recognition restarts
         let sessionFinal = '';          // finals from current recognition session
+        let wakeLock = null;
+
+        async function requestWakeLock() {
+            if ('wakeLock' in navigator) {
+                try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+            }
+        }
+
+        function releaseWakeLock() {
+            if (wakeLock) { wakeLock.release(); wakeLock = null; }
+        }
 
         function initRecognition() {
             const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -186,6 +197,7 @@
             accumulatedTranscript = '';
             sessionFinal = '';
             isRecording = true;
+            requestWakeLock();
             recordBtn.textContent = 'Tap to Stop';
             recordBtn.classList.add('recording');
             statusEl.textContent = 'Listening...';
@@ -197,6 +209,7 @@
 
         function stopRecording(clean = true) {
             isRecording = false;
+            releaseWakeLock();
             if (recognition) recognition.stop();
             recordBtn.textContent = 'Tap to Record';
             recordBtn.classList.remove('recording');
