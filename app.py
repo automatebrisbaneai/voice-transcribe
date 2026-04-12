@@ -43,7 +43,7 @@ async def clean_transcript(req: TranscriptRequest):
                     + req.text
                 )
             }],
-            "max_tokens": 1024,
+            "max_tokens": 8192,
         },
         timeout=30,
     )
