@@ -8,7 +8,7 @@ from pathlib import Path
 app = FastAPI()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "anthropic/claude-haiku-3-5"
+MODEL = "deepseek/deepseek-v3.2"
 
 class TranscriptRequest(BaseModel):
     text: str
