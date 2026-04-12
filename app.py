@@ -31,8 +31,11 @@ async def clean_transcript(req: TranscriptRequest):
             "messages": [{
                 "role": "user",
                 "content": (
-                    "Clean up this voice transcript. Fix grammar and punctuation, "
-                    "remove filler words (um, uh, like, you know, sort of), fix run-on sentences. "
+                    "Clean up this voice transcript into readable, properly punctuated text. "
+                    "The input has no punctuation — you must add it. "
+                    "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
+                    "Remove filler words (um, uh, like, you know, sort of). "
+                    "Fix run-on sentences by breaking them up. "
                     "Keep the meaning and tone exactly as intended. "
                     "Return only the cleaned text, nothing else.\n\n"
                     + req.text
