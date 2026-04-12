@@ -36,7 +36,8 @@ async def clean_transcript(req: TranscriptRequest):
                     "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
                     "Remove filler words (um, uh, like, you know, sort of). "
                     "Fix run-on sentences by breaking them up. "
-                    "Fix obvious speech recognition errors where context makes the intended word clear. "
+                    "Fix speech recognition errors by reading the full sentence and paragraph to understand intended meaning — "
+                    "use whole-context inference, not just adjacent words. "
                     "Keep the meaning and tone exactly as intended. "
                     "Return only the cleaned text, nothing else.\n\n"
                     + req.text
