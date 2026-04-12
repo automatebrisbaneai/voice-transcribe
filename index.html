@@ -226,13 +226,30 @@
 
         function setInterimText(text) {
             const words = text.trim().split(/\s+/).filter(Boolean);
-            const clearCount = 3;
-            if (words.length <= clearCount) {
-                interimEl.innerHTML = `<span class="clear">${text}</span>`;
+            const fadeWords = 6;
+            // blur/opacity for each position from the end (0=last word, 5=6th from end)
+            const levels = [
+                { blur: 0,    opacity: 1.0 },
+                { blur: 0.5,  opacity: 0.9 },
+                { blur: 1.5,  opacity: 0.78 },
+                { blur: 2.5,  opacity: 0.65 },
+                { blur: 3.5,  opacity: 0.52 },
+                { blur: 4.5,  opacity: 0.42 },
+            ];
+            if (words.length <= fadeWords) {
+                interimEl.innerHTML = words.map((w, i) => {
+                    const pos = words.length - 1 - i;
+                    const lvl = levels[Math.min(pos, levels.length - 1)];
+                    return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${w}</span>`;
+                }).join(' ');
             } else {
-                const blurred = words.slice(0, -clearCount).join(' ');
-                const clear = words.slice(-clearCount).join(' ');
-                interimEl.innerHTML = `<span class="blurred">${blurred}</span> <span class="clear">${clear}</span>`;
+                const blurred = words.slice(0, -fadeWords).join(' ');
+                const fading = words.slice(-fadeWords).map((w, i) => {
+                    const pos = fadeWords - 1 - i;
+                    const lvl = levels[Math.min(pos, levels.length - 1)];
+                    return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${w}</span>`;
+                }).join(' ');
+                interimEl.innerHTML = `<span class="blurred">${blurred}</span> ${fading}`;
             }
         }
 
