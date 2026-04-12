@@ -7,8 +7,8 @@ from pathlib import Path
 
 app = FastAPI()
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+MODEL = "anthropic/claude-haiku-3-5"
 
 class TranscriptRequest(BaseModel):
     text: str
@@ -20,18 +20,27 @@ async def root():
 
 @app.post("/clean")
 async def clean_transcript(req: TranscriptRequest):
-    prompt = (
-        "Clean up this voice transcript. Fix grammar and punctuation, "
-        "remove filler words (um, uh, like, you know, sort of), fix run-on sentences. "
-        "Keep the meaning and tone exactly as intended. "
-        "Return only the cleaned text, nothing else.\n\n"
-        + req.text
-    )
     response = requests.post(
-        GEMINI_URL,
-        json={"contents": [{"parts": [{"text": prompt}]}]},
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "Clean up this voice transcript. Fix grammar and punctuation, "
+                    "remove filler words (um, uh, like, you know, sort of), fix run-on sentences. "
+                    "Keep the meaning and tone exactly as intended. "
+                    "Return only the cleaned text, nothing else.\n\n"
+                    + req.text
+                )
+            }],
+            "max_tokens": 1024,
+        },
         timeout=30,
     )
-    data = response.json()
-    cleaned = data["candidates"][0]["content"]["parts"][0]["text"]
+    cleaned = response.json()["choices"][0]["message"]["content"]
     return {"cleaned": cleaned}
