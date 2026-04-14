@@ -212,6 +212,23 @@
     let cleanedSoFar = '';
     let preVoice     = '';
     let wakeLock     = null;
+    let chunkTimer   = null;
+
+    function startChunkTimer() {
+      chunkTimer = setInterval(() => {
+        if (!isRecording) return;
+        const text = (accumulated + sessionFinal).trim();
+        if (text) {
+          accumulated  = '';
+          sessionFinal = '';
+          cleanChunkInBackground(text);
+        }
+      }, 10000);
+    }
+
+    function stopChunkTimer() {
+      if (chunkTimer) { clearInterval(chunkTimer); chunkTimer = null; }
+    }
 
     function setCaption(voiceText) {
       targetEl.value = preVoice
@@ -272,11 +289,16 @@
           const chunkText = (accumulated + sessionFinal).trim();
           accumulated  = '';
           sessionFinal = '';
-          // Restart recognition immediately — don't wait for cleanup fetch
+          // Create a fresh recognition object before restarting — calling
+          // recognition.start() on the same object that just fired onend
+          // throws InvalidStateError on Chrome/Android, which the catch
+          // would previously swallow by calling stopVoice(false), silently
+          // killing recording on the first pause.
+          if (!initRecognition()) { stopVoice(false); return; }
           try {
             recognition.start();
           } catch {
-            // Recognition is in a bad state (e.g. tab backgrounded, InvalidStateError).
+            // Recognition is in a bad state (e.g. tab backgrounded).
             // Clean up gracefully rather than leaving isRecording true with dead recognition.
             stopVoice(false);
             return;
@@ -358,11 +380,13 @@
         interimEl.innerHTML = '';
       }
       recognition.start();
+      startChunkTimer();
       btnEl.disabled = false;
     }
 
     async function stopVoice(clean) {
       if (clean === undefined) clean = true;
+      stopChunkTimer();
       isRecording = false;
       if (wakeLock) { wakeLock.release(); wakeLock = null; }
       if (recognition) {
