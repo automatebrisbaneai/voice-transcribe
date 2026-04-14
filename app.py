@@ -1,3 +1,4 @@
+import json
 import os
 import requests
 from fastapi import FastAPI
@@ -9,6 +10,28 @@ app = FastAPI()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = "deepseek/deepseek-v3.2"
+
+
+def _load_croquet_dictionary() -> dict:
+    """Load croquet-dictionary.json from shared/ — tries app dir first, then parent."""
+    for base in (Path(__file__).parent, Path(__file__).parent.parent):
+        p = base / "shared" / "croquet-dictionary.json"
+        if p.is_file():
+            return json.loads(p.read_text(encoding="utf-8"))
+    return {"terms": [], "players": []}
+
+
+_DICTIONARY = _load_croquet_dictionary()
+_DICTIONARY_HINT = (
+    "The following are valid croquet terms that may appear in the transcript — "
+    "correct any misheard words to match these exactly: "
+    + ", ".join(_DICTIONARY.get("terms", []))
+    + ". "
+    "The following are Queensland croquet player names — "
+    "correct any misheard names to match these exactly: "
+    + ", ".join(_DICTIONARY.get("players", []))
+    + ". "
+) if (_DICTIONARY.get("terms") or _DICTIONARY.get("players")) else ""
 
 class TranscriptRequest(BaseModel):
     text: str
@@ -48,7 +71,8 @@ async def clean_transcript(req: TranscriptRequest):
             "messages": [{
                 "role": "user",
                 "content": (
-                    "Clean up this voice transcript into readable, properly punctuated text. "
+                    _DICTIONARY_HINT
+                    + "Clean up this voice transcript into readable, properly punctuated text. "
                     "The input has no punctuation — you must add it. "
                     "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
                     "Remove filler words (um, uh, like, you know, sort of). "
