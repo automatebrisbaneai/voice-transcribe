@@ -94,6 +94,13 @@
         0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.15); }
         50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0.08); }
       }
+      @keyframes vttChunkReveal {
+        from { filter: blur(4px); opacity: 0.4; }
+        to   { filter: none;      opacity: 1;   }
+      }
+      .vtt-chunk-new {
+        animation: vttChunkReveal 0.4s ease forwards;
+      }
       .vtt-dot {
         display: inline-block;
         width: 8px;
@@ -202,6 +209,7 @@
     let isRecording  = false;
     let accumulated  = '';
     let sessionFinal = '';
+    let cleanedSoFar = '';
     let preVoice     = '';
     let wakeLock     = null;
 
@@ -244,11 +252,9 @@
           if (event.results[i].isFinal) sessionFinal += event.results[i][0].transcript + ' ';
           else interim += event.results[i][0].transcript;
         }
-        const fullText = accumulated + sessionFinal + interim;
-        setCaption(fullText);
-        // Show previous text blurred with new words clear at the end
-        const displayText = preVoice ? preVoice.trimEnd() + ' ' + fullText : fullText;
-        setInterimText(interimEl, displayText);
+        // Interim div shows only current in-progress speech
+        const currentSpeech = sessionFinal + interim;
+        setInterimText(interimEl, currentSpeech);
       };
 
       recognition.onerror = (e) => {
@@ -262,18 +268,54 @@
 
       recognition.onend = () => {
         if (isRecording) {
-          accumulated  += sessionFinal;
-          sessionFinal  = '';
+          // Grab buffered text from this recognition cycle
+          const chunkText = (accumulated + sessionFinal).trim();
+          accumulated  = '';
+          sessionFinal = '';
+          // Restart recognition immediately — don't wait for cleanup fetch
           try {
             recognition.start();
           } catch {
             // Recognition is in a bad state (e.g. tab backgrounded, InvalidStateError).
             // Clean up gracefully rather than leaving isRecording true with dead recognition.
             stopVoice(false);
+            return;
+          }
+          if (chunkText) {
+            cleanChunkInBackground(chunkText);
           }
         }
       };
       return true;
+    }
+
+    function appendCleanedChunk(text) {
+      cleanedSoFar = cleanedSoFar ? cleanedSoFar.trimEnd() + '\n\n' + text : text;
+      setCaption(cleanedSoFar);
+      // Make textarea visible now that there's clean content
+      targetEl.style.display = '';
+      // Animate the textarea to signal new text landed
+      targetEl.classList.remove('vtt-chunk-new');
+      // Force reflow so removing+re-adding the class triggers the animation
+      void targetEl.offsetWidth;
+      targetEl.classList.add('vtt-chunk-new');
+      setTimeout(() => targetEl.classList.remove('vtt-chunk-new'), 450);
+    }
+
+    function cleanChunkInBackground(text) {
+      fetch(cleanUrl, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ text }),
+      })
+        .then(res => res.json())
+        .then(data => {
+          appendCleanedChunk(data.cleaned || text);
+        })
+        .catch(() => {
+          // Graceful fallback: use raw text if the clean request fails
+          appendCleanedChunk(text);
+        });
     }
 
     async function startVoice() {
@@ -291,6 +333,7 @@
       preVoice     = targetEl.value;
       accumulated  = '';
       sessionFinal = '';
+      cleanedSoFar = '';
       isRecording  = true;
       if ('wakeLock' in navigator) {
         try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
@@ -335,50 +378,55 @@
       btnEl.innerHTML = MIC_SVG;
       if (labelEl)  labelEl.textContent  = 'Talk to text';
 
-      const raw = (accumulated + sessionFinal).trim();
-      if (!clean || !raw) {
+      const remainingRaw = (accumulated + sessionFinal).trim();
+      // "Nothing heard" only if there's no cleaned text from progressive chunks either
+      if (!clean || (!remainingRaw && !cleanedSoFar)) {
         interimEl.style.display = 'none';
         targetEl.style.display  = '';
         if (clean && statusEl) statusEl.textContent = 'Nothing heard \u2014 try again.';
         return;
       }
 
-      // Keep blur visible with dot while processing
-      setInterimText(interimEl, raw, true);
-      if (statusEl) statusEl.textContent = 'Tidying up\u2026';
+      interimEl.style.display = 'none';
+      targetEl.style.display  = '';
       btnEl.disabled = true;
-      try {
-        const res  = await fetch(cleanUrl, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ text: raw }),
-        });
-        const data = await res.json();
-        setCaption(data.cleaned || raw);
-        if (statusEl) statusEl.textContent = '';
-      } catch {
-        if (statusEl) statusEl.textContent = '';
-      } finally {
-        // Now reveal the clean text
-        interimEl.style.display = 'none';
-        targetEl.style.display  = '';
-        btnEl.disabled = false;
 
-        // Highlight textarea and show edit hint
-        if (targetEl.value.trim()) {
-          targetEl.classList.add('vtt-textarea-highlight');
-          hintEl.classList.add('vtt-visible');
-          setTimeout(() => {
-            targetEl.classList.remove('vtt-textarea-highlight');
-            hintEl.classList.remove('vtt-visible');
-          }, 5000);
-          // Dismiss hint on tap
-          targetEl.addEventListener('focus', function dismissHint() {
-            targetEl.classList.remove('vtt-textarea-highlight');
-            hintEl.classList.remove('vtt-visible');
-            targetEl.removeEventListener('focus', dismissHint);
+      if (remainingRaw) {
+        // There's a final chunk not yet cleaned — send it through the same path
+        if (statusEl) statusEl.textContent = 'Tidying up\u2026';
+        try {
+          const res  = await fetch(cleanUrl, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ text: remainingRaw }),
           });
+          const data = await res.json();
+          appendCleanedChunk(data.cleaned || remainingRaw);
+          if (statusEl) statusEl.textContent = '';
+        } catch {
+          appendCleanedChunk(remainingRaw);
+          if (statusEl) statusEl.textContent = '';
         }
+      } else {
+        if (statusEl) statusEl.textContent = '';
+      }
+
+      btnEl.disabled = false;
+
+      // Highlight textarea and show edit hint
+      if (targetEl.value.trim()) {
+        targetEl.classList.add('vtt-textarea-highlight');
+        hintEl.classList.add('vtt-visible');
+        setTimeout(() => {
+          targetEl.classList.remove('vtt-textarea-highlight');
+          hintEl.classList.remove('vtt-visible');
+        }, 5000);
+        // Dismiss hint on tap
+        targetEl.addEventListener('focus', function dismissHint() {
+          targetEl.classList.remove('vtt-textarea-highlight');
+          hintEl.classList.remove('vtt-visible');
+          targetEl.removeEventListener('focus', dismissHint);
+        });
       }
     }
 
