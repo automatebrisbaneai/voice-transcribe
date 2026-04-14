@@ -110,15 +110,15 @@
         const copyBtn = document.getElementById('copyBtn');
         const clearBtn = document.getElementById('clearBtn');
 
-        // Show result area once textarea has content
-        const observer = new MutationObserver(() => checkResult());
+        // Show result area whenever the textarea has content.
+        // Value changes don't fire MutationObserver events, so we use a
+        // lightweight interval plus an input listener for manual edits.
         function checkResult() {
-            if (cleanedText.value.trim() && cleanedText.style.display !== 'none') {
-                resultArea.style.display = 'flex';
-            }
+            const hasContent = cleanedText.value.trim().length > 0;
+            resultArea.style.display = hasContent ? 'flex' : 'none';
         }
-        // Poll for textarea changes (value changes don't fire mutation events)
-        setInterval(checkResult, 500);
+        setInterval(checkResult, 300);
+        cleanedText.addEventListener('input', checkResult);
 
         copyBtn.addEventListener('click', () => {
             navigator.clipboard.writeText(cleanedText.value).then(() => {
@@ -132,10 +132,10 @@
         });
 
         clearBtn.addEventListener('click', () => {
-            resultArea.style.display = 'none';
             cleanedText.value = '';
             cleanedText.style.display = 'none';
             document.getElementById('voiceStatus').textContent = '';
+            checkResult();
         });
     </script>
 </body>
