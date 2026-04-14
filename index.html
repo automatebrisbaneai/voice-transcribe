@@ -61,20 +61,54 @@
             color: #1e293b;
         }
         #cleanedText:focus { outline: 2px solid #2563eb; border-color: transparent; }
-        .actions { display: flex; gap: 10px; }
-        .actions button {
-            flex: 1;
-            padding: 16px;
-            font-size: 1rem;
-            font-weight: 600;
-            border: none;
-            border-radius: 12px;
+        .actions {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        #copyBtn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 6px 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            font-family: inherit;
+            color: #475569;
+            background: transparent;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
             cursor: pointer;
+            transition: background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+                        border-color 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+                        color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
             -webkit-tap-highlight-color: transparent;
         }
-        #copyBtn { background: #16a34a; color: white; }
-        #copyBtn.copied { background: #166534; }
-        #clearBtn { background: #e2e8f0; color: #475569; }
+        #copyBtn:hover {
+            background: #f1f5f9;
+            border-color: #94a3b8;
+        }
+        #copyBtn:active { background: #e2e8f0; }
+        #copyBtn .icon { display: flex; width: 14px; height: 14px; }
+        #copyBtn .icon svg { width: 100%; height: 100%; }
+        #copyBtn.copied {
+            color: #16a34a;
+            border-color: #86efac;
+            background: #f0fdf4;
+        }
+        #clearBtn {
+            padding: 4px 0;
+            font-size: 0.78rem;
+            font-weight: 400;
+            font-family: inherit;
+            color: #94a3b8;
+            background: none;
+            border: none;
+            cursor: pointer;
+            transition: color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+            -webkit-tap-highlight-color: transparent;
+        }
+        #clearBtn:hover { color: #64748b; }
     </style>
 </head>
 <body>
@@ -89,8 +123,11 @@
         <textarea id="cleanedText" style="display:none;" placeholder="Your transcription will appear here..."></textarea>
         <div id="resultArea">
             <div class="actions">
-                <button id="copyBtn">Copy</button>
-                <button id="clearBtn">Start Over</button>
+                <button id="copyBtn">
+                    <span class="icon" id="copyIcon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
+                    <span id="copyLabel">Copy</span>
+                </button>
+                <button id="clearBtn">Start over</button>
             </div>
         </div>
     </div>
@@ -120,12 +157,19 @@
         setInterval(checkResult, 300);
         cleanedText.addEventListener('input', checkResult);
 
+        const copyIcon = document.getElementById('copyIcon');
+        const copyLabel = document.getElementById('copyLabel');
+        const clipboardSvg = copyIcon.innerHTML;
+        const checkSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+
         copyBtn.addEventListener('click', () => {
             navigator.clipboard.writeText(cleanedText.value).then(() => {
-                copyBtn.textContent = 'Copied!';
+                copyIcon.innerHTML = checkSvg;
+                copyLabel.textContent = 'Copied';
                 copyBtn.classList.add('copied');
                 setTimeout(() => {
-                    copyBtn.textContent = 'Copy';
+                    copyIcon.innerHTML = clipboardSvg;
+                    copyLabel.textContent = 'Copy';
                     copyBtn.classList.remove('copied');
                 }, 2000);
             });
