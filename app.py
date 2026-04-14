@@ -18,6 +18,23 @@ async def root():
     html_path = Path(__file__).parent / "index.html"
     return HTMLResponse(html_path.read_text())
 
+
+@app.get("/shared/{filename}")
+async def shared_file(filename: str):
+    from fastapi.responses import Response
+    from fastapi import HTTPException
+    safe = Path(filename).name
+    # Docker: shared/ is inside app dir; local dev: shared/ is sibling at apps/shared/
+    file_path = Path(__file__).parent / "shared" / safe
+    if not file_path.is_file():
+        file_path = Path(__file__).parent.parent / "shared" / safe
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(
+        content=file_path.read_text(encoding="utf-8"),
+        media_type="application/javascript",
+    )
+
 @app.post("/clean")
 async def clean_transcript(req: TranscriptRequest):
     response = requests.post(
