@@ -188,6 +188,7 @@
       targetEl.parentNode.insertBefore(btnEl, interimEl);
     } else {
       btnEl.classList.add('vtt-btn');
+      btnEl.innerHTML = MIC_SVG;
     }
 
     // Edit hint — appears after cleanup to nudge users to review
