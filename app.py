@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import sys
 import requests
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -10,6 +12,38 @@ app = FastAPI()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = "deepseek/deepseek-v3.2"
+
+MIN_WORD_CHARS = 3
+
+_SUSPICIOUS_STARTS = (
+    "i ", "i'", "i\u2019", "sure", "certainly", "okay", "of course",
+    "please", "here is", "here's", "understood",
+)
+_SUSPICIOUS_SUBSTRINGS = (
+    "provide the transcript", "provide the text", "provide the voice",
+    "i will process", "i understand", "i'll clean", "i will clean",
+    "as an ai", "happy to help",
+)
+
+
+def _looks_like_meta_response(raw_input: str, model_output: str) -> bool:
+    if not model_output:
+        return False
+    stripped = model_output.strip().lower()
+    if not stripped:
+        return False
+    if stripped.startswith(_SUSPICIOUS_STARTS):
+        return True
+    if any(s in stripped for s in _SUSPICIOUS_SUBSTRINGS):
+        return True
+    # Output wildly longer than input with no shared vocabulary is suspicious
+    in_words = {w for w in re.findall(r"[a-z]+", raw_input.lower()) if len(w) > 2}
+    out_words = re.findall(r"[a-z]+", stripped)
+    if in_words and len(out_words) > len(in_words) * 3:
+        overlap = sum(1 for w in out_words if w in in_words)
+        if overlap < max(2, len(in_words) // 3):
+            return True
+    return False
 
 
 def _load_croquet_dictionary() -> dict:
@@ -58,8 +92,30 @@ async def shared_file(filename: str):
         media_type="application/javascript",
     )
 
+_SYSTEM_PROMPT = (
+    "You are a transcript cleaner. You receive raw voice-recognition text "
+    "and return ONLY the cleaned text. Rules:\n"
+    "- Add punctuation (commas, full stops, question marks).\n"
+    "- Capitalise the start of sentences.\n"
+    "- Remove filler words (um, uh, like, you know, sort of).\n"
+    "- Fix run-on sentences by breaking them up.\n"
+    "- Fix speech-recognition errors using whole-sentence context.\n"
+    "- Keep meaning and tone exactly as intended.\n"
+    "You NEVER respond conversationally. You NEVER ask for input. "
+    "You NEVER explain what you are doing. If the input is empty, whitespace, "
+    "a single word, or otherwise not a usable transcript, return it verbatim. "
+    "Output is the cleaned transcript text and nothing else.\n"
+    + _DICTIONARY_HINT
+)
+
+
 @app.post("/clean")
 async def clean_transcript(req: TranscriptRequest):
+    raw = req.text or ""
+    word_chars = sum(1 for c in raw if c.isalpha())
+    if word_chars < MIN_WORD_CHARS:
+        return {"cleaned": raw}
+
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -68,22 +124,10 @@ async def clean_transcript(req: TranscriptRequest):
         },
         json={
             "model": MODEL,
-            "messages": [{
-                "role": "user",
-                "content": (
-                    _DICTIONARY_HINT
-                    + "Clean up this voice transcript into readable, properly punctuated text. "
-                    "The input has no punctuation — you must add it. "
-                    "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
-                    "Remove filler words (um, uh, like, you know, sort of). "
-                    "Fix run-on sentences by breaking them up. "
-                    "Fix speech recognition errors by reading the full sentence and paragraph to understand intended meaning — "
-                    "use whole-context inference, not just adjacent words. "
-                    "Keep the meaning and tone exactly as intended. "
-                    "Return only the cleaned text, nothing else.\n\n"
-                    + req.text
-                )
-            }],
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": raw},
+            ],
             "max_tokens": 8192,
         },
         timeout=30,
@@ -91,4 +135,10 @@ async def clean_transcript(req: TranscriptRequest):
     data = response.json()
     if "choices" not in data:
         raise ValueError(f"OpenRouter error: {data}")
-    return {"cleaned": data["choices"][0]["message"]["content"]}
+    cleaned = data["choices"][0]["message"]["content"]
+
+    if _looks_like_meta_response(raw, cleaned):
+        print(f"[suspicious-output] falling back to raw. in={raw!r} out={cleaned!r}", file=sys.stderr)
+        return {"cleaned": raw}
+
+    return {"cleaned": cleaned}
