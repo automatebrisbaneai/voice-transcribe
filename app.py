@@ -353,7 +353,11 @@ async def shared_file(filename: str):
     file_path = Path(__file__).parent / "shared" / filename
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
-    return Response(content=file_path.read_text(encoding="utf-8"), media_type=content_type)
+    return Response(
+        content=file_path.read_text(encoding="utf-8"),
+        media_type=content_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/clean")
