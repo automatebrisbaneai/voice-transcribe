@@ -96,7 +96,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "deepseek/deepseek-v3.2"
+MODEL = "deepseek/deepseek-v4-lite"
 
 MIN_WORD_CHARS = 3
 MAX_CHUNK_CHARS = 2_000
