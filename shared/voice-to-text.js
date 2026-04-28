@@ -294,7 +294,8 @@
     // overlapping round-trips can never produce a visual gap.
     let inFlightChunks     = [];   // array of { id, text } — drives the blur display
     let inFlightSeq        = 0;    // monotonic id, doubles as chunk sequence number
-    let postStopProcessing = false; // true while interim stays up waiting for in-flight chunks after stop
+    let postStopProcessing    = false; // true while interim stays up waiting for in-flight chunks after stop
+    let stopVoiceFetchPending = false; // true while stopVoice() is awaiting its own final-chunk fetch
     // Seq-based ordered commit: chunks must be appended to the textarea in the
     // order they were spoken, even if /clean responses arrive out of order.
     let committedSeq       = 0;    // seq of the last chunk flushed to appendCleanedChunk
@@ -582,7 +583,10 @@
           remove();
           // After removing this chunk, check whether all post-stop chunks have
           // landed. This fires AFTER remove() so inFlightChunks.length is correct.
-          if (!isRecording && postStopProcessing) {
+          // Skip if stopVoice() is still awaiting its own final-chunk fetch —
+          // that fetch is not tracked in inFlightChunks/pendingCommit, so
+          // we'd otherwise call finaliseToTextarea() too early.
+          if (!isRecording && postStopProcessing && !stopVoiceFetchPending) {
             const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
             renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
             if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
@@ -609,8 +613,9 @@
       pendingFinal       = '';
       pendingFinalCount  = 0;
       cleanedSoFar       = '';
-      postStopProcessing = false;
-      inFlightChunks     = [];
+      postStopProcessing    = false;
+      stopVoiceFetchPending = false;
+      inFlightChunks        = [];
       inFlightSeq        = 0;
       committedSeq       = 0;
       pendingCommit      = new Map();
@@ -690,6 +695,7 @@
           // There's a final chunk not yet cleaned — send it synchronously.
           if (statusEl) statusEl.textContent = 'Tidying up\u2026';
           if (cleanUrl) {
+            stopVoiceFetchPending = true;
             try {
               const res  = await fetch(cleanUrl, {
                 method:  'POST',
@@ -705,6 +711,8 @@
               }
             } catch {
               appendCleanedChunk(remainingRaw);
+            } finally {
+              stopVoiceFetchPending = false;
             }
           } else {
             // noCleanup mode — append raw text directly.
