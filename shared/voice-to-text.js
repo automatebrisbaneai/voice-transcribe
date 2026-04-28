@@ -294,6 +294,7 @@
     // overlapping round-trips can never produce a visual gap.
     let inFlightChunks     = [];   // array of { id, text } — drives the blur display
     let inFlightSeq        = 0;    // monotonic id, doubles as chunk sequence number
+    let postStopProcessing = false; // true while interim stays up waiting for in-flight chunks after stop
     // Seq-based ordered commit: chunks must be appended to the textarea in the
     // order they were spoken, even if /clean responses arrive out of order.
     let committedSeq       = 0;    // seq of the last chunk flushed to appendCleanedChunk
@@ -309,6 +310,31 @@
         const text = pendingCommit.get(committedSeq);
         pendingCommit.delete(committedSeq);
         appendCleanedChunk(text);
+      }
+    }
+
+    // Switch from interim display to the editable textarea once all chunks have landed.
+    function finaliseToTextarea() {
+      if (!postStopProcessing) return; // guard against double-call
+      postStopProcessing = false;
+      interimEl.style.display = 'none';
+      targetEl.style.display  = '';
+      if (statusEl) statusEl.textContent = '';
+      targetEl.classList.remove('vtt-chunk-new');
+      void targetEl.offsetWidth;
+      targetEl.classList.add('vtt-chunk-new');
+      setTimeout(() => targetEl.classList.remove('vtt-chunk-new'), 450);
+      if (targetEl.value.trim()) {
+        targetEl.classList.add('vtt-textarea-highlight');
+        hintEl.classList.add('vtt-visible');
+        setTimeout(() => {
+          targetEl.classList.remove('vtt-textarea-highlight');
+          hintEl.classList.remove('vtt-visible');
+        }, 5000);
+        targetEl.addEventListener('focus', function dismissHint() {
+          targetEl.classList.remove('vtt-textarea-highlight');
+          hintEl.classList.remove('vtt-visible');
+        }, { once: true });
       }
     }
 
@@ -460,8 +486,10 @@
         const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()]
           .filter(Boolean).join(' ');
         renderInterim(interimEl, cleanedPrefix, pendingFinal + latestInterim, true);
-      } else {
+      } else if (!postStopProcessing) {
         // Post-stop finalisation — textarea is the edit surface now.
+        // (When postStopProcessing is true, finaliseToTextarea() handles the switch
+        // once all in-flight background chunks have landed.)
         if (statusEl) statusEl.textContent = '';
         targetEl.style.display = '';
         targetEl.classList.remove('vtt-chunk-new');
@@ -484,6 +512,9 @@
         pendingCommit.set(id, text);
         inFlightChunks = inFlightChunks.filter(c => c.id !== id);
         tryFlushCommits();
+        if (!isRecording && postStopProcessing && inFlightChunks.length === 0 && pendingCommit.size === 0) {
+          finaliseToTextarea();
+        }
         return;
       }
 
@@ -549,6 +580,15 @@
           // remove() ALWAYS runs — regardless of happy path, error, or throw
           // inside the .then body — so inFlightChunks never leaks an entry.
           remove();
+          // After removing this chunk, check whether all post-stop chunks have
+          // landed. This fires AFTER remove() so inFlightChunks.length is correct.
+          if (!isRecording && postStopProcessing) {
+            const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
+            renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
+            if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
+              finaliseToTextarea();
+            }
+          }
         });
     }
 
@@ -569,6 +609,7 @@
       pendingFinal       = '';
       pendingFinalCount  = 0;
       cleanedSoFar       = '';
+      postStopProcessing = false;
       inFlightChunks     = [];
       inFlightSeq        = 0;
       committedSeq       = 0;
@@ -630,8 +671,15 @@
         return;
       }
 
-      interimEl.style.display = 'none';
-      targetEl.style.display  = '';
+      // Keep the interim visible while in-flight chunks finish resolving so the
+      // box stays populated rather than flashing empty. finaliseToTextarea() will
+      // switch to the editable textarea once every chunk has landed.
+      postStopProcessing = true;
+      renderInterim(interimEl,
+        [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' '),
+        [inFlightJoined(), remainingRaw].filter(s => s && s.trim()).join(' '),
+        false // no dot — recording has stopped
+      );
       btnEl.disabled = true;
 
       // Wrap all post-stop cleanup in try/finally so the button is ALWAYS
@@ -662,7 +710,6 @@
             // noCleanup mode — append raw text directly.
             appendCleanedChunk(remainingRaw);
           }
-          if (statusEl) statusEl.textContent = '';
         } else if (hasInFlight) {
           if (statusEl) statusEl.textContent = 'Tidying up\u2026';
         } else {
@@ -673,20 +720,15 @@
         btnEl.disabled = false;
       }
 
-      // Highlight textarea and show edit hint
-      if (targetEl.value.trim()) {
-        targetEl.classList.add('vtt-textarea-highlight');
-        hintEl.classList.add('vtt-visible');
-        setTimeout(() => {
-          targetEl.classList.remove('vtt-textarea-highlight');
-          hintEl.classList.remove('vtt-visible');
-        }, 5000);
-        // Dismiss hint on focus — { once: true } auto-removes the listener so
-        // the explicit removeEventListener call is not needed.
-        targetEl.addEventListener('focus', function dismissHint() {
-          targetEl.classList.remove('vtt-textarea-highlight');
-          hintEl.classList.remove('vtt-visible');
-        }, { once: true });
+      // Update interim to reflect the final chunk now cleaned (no longer blurred).
+      // Background chunks' .finally handlers will continue updating and will call
+      // finaliseToTextarea() when the last one lands.
+      if (postStopProcessing) {
+        const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
+        renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
+      }
+      if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
+        finaliseToTextarea();
       }
     }
 
