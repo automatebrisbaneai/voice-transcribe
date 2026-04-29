@@ -98,6 +98,9 @@ app = FastAPI(lifespan=lifespan)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = "deepseek/deepseek-v4-lite"
 
+UTIL_PB_URL = os.environ.get("UTIL_PB_URL", "http://util.croquetwade.com")
+SUBMISSIONS_COLLECTION = "voice_submissions"
+
 MIN_WORD_CHARS = 3
 MAX_CHUNK_CHARS = 2_000
 
@@ -190,6 +193,12 @@ _DICTIONARY_HINT = (
 
 class TranscriptRequest(BaseModel):
     text: str
+
+
+class SubmitRequest(BaseModel):
+    name: str
+    email: str = ""
+    transcript: str
 
 
 # ---------------------------------------------------------------------------
@@ -493,3 +502,44 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
             },
         )
         raise HTTPException(status_code=502, detail="Transcript cleaning failed, please try again.")
+
+
+@app.post("/submit")
+async def submit_transcript(request: Request, req: SubmitRequest):
+    """Save a transcript submission to the utility PocketBase."""
+    client: httpx.AsyncClient = request.app.state.http
+
+    name = (req.name or "").strip()
+    email = (req.email or "").strip()
+    transcript = (req.transcript or "").strip()
+
+    if not name:
+        raise HTTPException(status_code=422, detail="Name is required.")
+    if not transcript:
+        raise HTTPException(status_code=422, detail="Transcript is required.")
+    if len(transcript) > 200_000:
+        raise HTTPException(status_code=413, detail="Transcript too large.")
+
+    url = f"{UTIL_PB_URL}/api/collections/{SUBMISSIONS_COLLECTION}/records"
+    payload = {"sender_name": name, "sender_email": email, "transcript": transcript}
+
+    try:
+        res = await client.post(url, json=payload, timeout=httpx.Timeout(10.0))
+        if res.status_code in (200, 201):
+            record = res.json()
+            logger.info("Submission saved", extra={"event": "submit_ok", "record_id": record.get("id")})
+            return {"ok": True, "id": record.get("id")}
+        else:
+            logger.error(
+                "PocketBase submission failed",
+                extra={"event": "submit_pb_error", "status": res.status_code, "body": res.text[:300]},
+            )
+            raise HTTPException(status_code=502, detail="Could not save submission — please try again.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Submit unexpected error",
+            extra={"event": "submit_error", "exc_type": type(e).__name__, "exc_msg": str(e)},
+        )
+        raise HTTPException(status_code=502, detail="Could not save submission — please try again.")

@@ -55,7 +55,8 @@
             line-height: 1.6;
             border: 1px solid #e2e8f0;
             border-radius: 10px;
-            resize: vertical;
+            resize: none;
+            overflow: hidden;
             font-family: inherit;
             background: white;
             color: #1e293b;
@@ -115,6 +116,74 @@
         }
         #downloadBtn:hover { background: #f1f5f9; border-color: #94a3b8; }
         #downloadBtn:active { background: #e2e8f0; }
+        #sendBtn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 6px 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            font-family: inherit;
+            color: white;
+            background: #73182C;
+            border: 1px solid #73182C;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+            -webkit-tap-highlight-color: transparent;
+        }
+        #sendBtn:hover { background: #5a1221; border-color: #5a1221; }
+        #sendBtn:active { background: #3f0d18; }
+        #sendBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+        /* Modal */
+        #sendModal {
+            display: none;
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.45);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        #sendModal.open { display: flex; }
+        #sendModalBox {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            width: 100%;
+            max-width: 380px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        #sendModalBox h2 { font-size: 1rem; font-weight: 600; color: #1e293b; }
+        .modal-field { display: flex; flex-direction: column; gap: 4px; }
+        .modal-field label { font-size: 0.75rem; color: #64748b; font-weight: 500; }
+        .modal-field input {
+            padding: 9px 12px;
+            font-size: 0.9rem;
+            font-family: inherit;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            outline: none;
+            color: #1e293b;
+        }
+        .modal-field input:focus { border-color: #73182C; box-shadow: 0 0 0 3px rgba(115,24,44,0.1); }
+        #sendModalStatus { font-size: 0.8rem; min-height: 18px; color: #64748b; }
+        #sendModalStatus.error { color: #dc2626; }
+        #sendModalStatus.success { color: #16a34a; }
+        .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+        #sendModalCancel {
+            padding: 7px 14px; font-size: 0.82rem; font-family: inherit;
+            background: none; border: 1px solid #e2e8f0; border-radius: 6px;
+            cursor: pointer; color: #64748b;
+        }
+        #sendModalConfirm {
+            padding: 7px 14px; font-size: 0.82rem; font-family: inherit;
+            background: #73182C; color: white; border: none; border-radius: 6px;
+            cursor: pointer; font-weight: 500;
+        }
+        #sendModalConfirm:disabled { opacity: 0.5; cursor: not-allowed; }
         #clearBtn {
             padding: 4px 0;
             font-size: 0.78rem;
@@ -150,7 +219,7 @@
         <textarea id="cleanedText" style="display:none;" placeholder="Your transcription will appear here..."></textarea>
         <div id="resultArea">
             <div class="actions">
-                <div style="display:flex;gap:8px;">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     <button id="copyBtn">
                         <span class="icon" id="copyIcon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
                         <span id="copyLabel">Copy</span>
@@ -159,12 +228,34 @@
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                         Download
                     </button>
+                    <button id="sendBtn">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                        Send to Claude
+                    </button>
                 </div>
                 <button id="clearBtn">Start over</button>
             </div>
         </div>
     </div>
-    <div style="position:fixed;bottom:8px;right:10px;font-size:0.65rem;color:#cbd5e1;user-select:none;">v1.5</div>
+    <div id="sendModal">
+        <div id="sendModalBox">
+            <h2>Send transcript to Claude</h2>
+            <div class="modal-field">
+                <label for="senderName">Your name</label>
+                <input id="senderName" type="text" placeholder="Jane Smith" autocomplete="name">
+            </div>
+            <div class="modal-field">
+                <label for="senderEmail">Your email (optional)</label>
+                <input id="senderEmail" type="email" placeholder="jane@example.com" autocomplete="email">
+            </div>
+            <div id="sendModalStatus"></div>
+            <div class="modal-actions">
+                <button id="sendModalCancel">Cancel</button>
+                <button id="sendModalConfirm">Send</button>
+            </div>
+        </div>
+    </div>
+    <div style="position:fixed;bottom:8px;right:10px;font-size:0.65rem;color:#cbd5e1;user-select:none;">v1.6</div>
 
     <script src="/shared/voice-to-text.js"></script>
     <script>
@@ -243,9 +334,84 @@
             URL.revokeObjectURL(url);
         });
 
+        // ── Textarea auto-resize ─────────────────────────────────────────────
+        function autoResize() {
+            cleanedText.style.height = 'auto';
+            cleanedText.style.height = Math.max(130, cleanedText.scrollHeight) + 'px';
+        }
+        cleanedText.addEventListener('input', autoResize);
+        // Also resize when content is set programmatically
+        const _origCheckResult = checkResult;
+        function checkResult() {
+            _origCheckResult();
+            if (cleanedText.value.trim()) autoResize();
+        }
+
+        // ── Send to Claude modal ─────────────────────────────────────────────
+        const sendBtn      = document.getElementById('sendBtn');
+        const sendModal    = document.getElementById('sendModal');
+        const sendConfirm  = document.getElementById('sendModalConfirm');
+        const sendCancel   = document.getElementById('sendModalCancel');
+        const sendStatus   = document.getElementById('sendModalStatus');
+
+        sendBtn.addEventListener('click', () => {
+            sendStatus.textContent = '';
+            sendStatus.className = '';
+            sendModal.classList.add('open');
+            document.getElementById('senderName').focus();
+        });
+
+        sendCancel.addEventListener('click', () => sendModal.classList.remove('open'));
+        sendModal.addEventListener('click', (e) => { if (e.target === sendModal) sendModal.classList.remove('open'); });
+
+        sendConfirm.addEventListener('click', async () => {
+            const name = document.getElementById('senderName').value.trim();
+            const email = document.getElementById('senderEmail').value.trim();
+            const transcript = cleanedText.value.trim();
+
+            if (!name) {
+                sendStatus.textContent = 'Please enter your name.';
+                sendStatus.className = 'error';
+                document.getElementById('senderName').focus();
+                return;
+            }
+            if (!transcript) {
+                sendStatus.textContent = 'No transcript to send.';
+                sendStatus.className = 'error';
+                return;
+            }
+
+            sendConfirm.disabled = true;
+            sendStatus.textContent = 'Sending…';
+            sendStatus.className = '';
+
+            try {
+                const res = await fetch('/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, email, transcript }),
+                });
+                if (res.ok) {
+                    sendStatus.textContent = 'Sent! Claude will be in touch.';
+                    sendStatus.className = 'success';
+                    setTimeout(() => sendModal.classList.remove('open'), 2000);
+                } else {
+                    const d = await res.json().catch(() => ({}));
+                    sendStatus.textContent = d.detail || 'Send failed — please try again.';
+                    sendStatus.className = 'error';
+                }
+            } catch {
+                sendStatus.textContent = 'Network error — please try again.';
+                sendStatus.className = 'error';
+            } finally {
+                sendConfirm.disabled = false;
+            }
+        });
+
         clearBtn.addEventListener('click', () => {
             cleanedText.value = '';
             cleanedText.style.display = 'none';
+            cleanedText.style.height = '';
             document.getElementById('voiceStatus').textContent = '';
             recoverBanner.style.display = 'none';
             vtt.clearSaved();
