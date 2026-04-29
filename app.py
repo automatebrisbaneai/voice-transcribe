@@ -98,7 +98,7 @@ app = FastAPI(lifespan=lifespan)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = "deepseek/deepseek-v4-lite"
 
-UTIL_PB_URL = os.environ.get("UTIL_PB_URL", "http://util.croquetwade.com")
+UTIL_PB_URL = os.environ.get("UTIL_PB_URL", "https://util.croquetwade.com")
 SUBMISSIONS_COLLECTION = "voice_submissions"
 
 MIN_WORD_CHARS = 3
@@ -524,7 +524,7 @@ async def submit_transcript(request: Request, req: SubmitRequest):
     payload = {"sender_name": name, "sender_email": email, "transcript": transcript}
 
     try:
-        res = await client.post(url, json=payload, timeout=httpx.Timeout(10.0))
+        res = await client.post(url, json=payload, timeout=httpx.Timeout(10.0), follow_redirects=True)
         if res.status_code in (200, 201):
             record = res.json()
             logger.info("Submission saved", extra={"event": "submit_ok", "record_id": record.get("id")})
