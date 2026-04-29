@@ -96,6 +96,25 @@
             border-color: #86efac;
             background: #f0fdf4;
         }
+        #downloadBtn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 6px 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            font-family: inherit;
+            color: #475569;
+            background: transparent;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.15s cubic-bezier(0.4, 0, 0.2, 1),
+                        border-color 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+            -webkit-tap-highlight-color: transparent;
+        }
+        #downloadBtn:hover { background: #f1f5f9; border-color: #94a3b8; }
+        #downloadBtn:active { background: #e2e8f0; }
         #clearBtn {
             padding: 4px 0;
             font-size: 0.78rem;
@@ -114,6 +133,14 @@
 <body>
     <div class="container">
         <h1>Voice Transcribe</h1>
+        <div id="recoverBanner" style="display:none;background:#fefce8;border:1px solid #fde047;border-radius:8px;padding:10px 14px;font-size:0.82rem;color:#713f12;">
+            <div style="margin-bottom:5px;font-weight:500;">Session recovered</div>
+            <div id="recoverPreview" style="color:#92400e;margin-bottom:8px;word-break:break-word;"></div>
+            <div style="display:flex;gap:8px;">
+                <button id="recoverLoad" style="padding:4px 10px;font-size:0.78rem;font-family:inherit;background:#713f12;color:white;border:none;border-radius:5px;cursor:pointer;">Load it</button>
+                <button id="recoverDismiss" style="padding:4px 10px;font-size:0.78rem;font-family:inherit;background:none;border:1px solid #fde047;border-radius:5px;cursor:pointer;color:#713f12;">Dismiss</button>
+            </div>
+        </div>
         <div class="voice-row">
             <span id="voiceLabel">Tap mic to start</span>
             <button id="voiceBtn" type="button" aria-label="Record voice"></button>
@@ -123,15 +150,21 @@
         <textarea id="cleanedText" style="display:none;" placeholder="Your transcription will appear here..."></textarea>
         <div id="resultArea">
             <div class="actions">
-                <button id="copyBtn">
-                    <span class="icon" id="copyIcon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
-                    <span id="copyLabel">Copy</span>
-                </button>
+                <div style="display:flex;gap:8px;">
+                    <button id="copyBtn">
+                        <span class="icon" id="copyIcon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
+                        <span id="copyLabel">Copy</span>
+                    </button>
+                    <button id="downloadBtn">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        Download
+                    </button>
+                </div>
                 <button id="clearBtn">Start over</button>
             </div>
         </div>
     </div>
-    <div style="position:fixed;bottom:8px;right:10px;font-size:0.65rem;color:#cbd5e1;user-select:none;">v1.4</div>
+    <div style="position:fixed;bottom:8px;right:10px;font-size:0.65rem;color:#cbd5e1;user-select:none;">v1.5</div>
 
     <script src="/shared/voice-to-text.js"></script>
     <script>
@@ -143,10 +176,32 @@
             label:   'voiceLabel',
         });
 
-        const resultArea = document.getElementById('resultArea');
-        const cleanedText = document.getElementById('cleanedText');
-        const copyBtn = document.getElementById('copyBtn');
-        const clearBtn = document.getElementById('clearBtn');
+        const resultArea   = document.getElementById('resultArea');
+        const cleanedText  = document.getElementById('cleanedText');
+        const copyBtn      = document.getElementById('copyBtn');
+        const clearBtn     = document.getElementById('clearBtn');
+        const downloadBtn  = document.getElementById('downloadBtn');
+        const recoverBanner = document.getElementById('recoverBanner');
+
+        // ── Recovery banner ──────────────────────────────────────────────────
+        const saved = vtt.savedSession();
+        if (saved) {
+            const preview = document.getElementById('recoverPreview');
+            preview.textContent = saved.length > 80 ? saved.slice(0, 80) + '…' : saved;
+            recoverBanner.style.display = '';
+        }
+
+        document.getElementById('recoverLoad').addEventListener('click', () => {
+            cleanedText.value = saved;
+            cleanedText.style.display = '';
+            recoverBanner.style.display = 'none';
+            checkResult();
+        });
+
+        document.getElementById('recoverDismiss').addEventListener('click', () => {
+            vtt.clearSaved();
+            recoverBanner.style.display = 'none';
+        });
 
         // Show result area whenever the textarea has content.
         // Value changes don't fire MutationObserver events, so we use a
@@ -176,10 +231,24 @@
             });
         });
 
+        downloadBtn.addEventListener('click', () => {
+            const text = cleanedText.value;
+            if (!text.trim()) return;
+            const blob = new Blob([text], { type: 'text/plain' });
+            const url  = URL.createObjectURL(blob);
+            const a    = document.createElement('a');
+            a.href     = url;
+            a.download = 'transcript-' + new Date().toISOString().slice(0, 10) + '.txt';
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+
         clearBtn.addEventListener('click', () => {
             cleanedText.value = '';
             cleanedText.style.display = 'none';
             document.getElementById('voiceStatus').textContent = '';
+            recoverBanner.style.display = 'none';
+            vtt.clearSaved();
             checkResult();
         });
     </script>

@@ -1,5 +1,5 @@
 /**
- * Voice-to-Text v1.4
+ * Voice-to-Text v1.5
  * Drop-in voice transcription with blur interim display.
  *
  * Usage:
@@ -138,6 +138,8 @@
   // LLM mishandles — skip it until either the speaker keeps talking (so
   // the chunk grows) or MAX_CHUNK_MS fires (safety fallback).
   const MIN_CHUNK_CHARS = 40;
+  const AUTOSAVE_KEY      = 'vtt-autosave';
+  const INTERIM_MAX_WORDS = 100; // cap cleaned-prefix word count in interim display
 
   // ── Meta-response detector ──────────────────────────────────────────────
   // Matches the same patterns the backend fallbacks catch — this is
@@ -214,8 +216,17 @@
   // inside the interim div, so the user sees one flowing transcript where the
   // cleaned prefix grows in place as chunks come back from /clean.
   function renderInterim(el, cleanedText, liveText, showDot) {
-    const cleanedPart = cleanedText && cleanedText.trim()
-      ? `<span class="vtt-cleaned">${esc(cleanedText.trim())}</span>`
+    // Cap the cleaned prefix at INTERIM_MAX_WORDS so the DOM stays bounded on long sessions.
+    // The full text is already safe in the textarea; this only affects the visual display.
+    let displayCleaned = cleanedText && cleanedText.trim();
+    if (displayCleaned) {
+      const words = displayCleaned.split(/\s+/);
+      if (words.length > INTERIM_MAX_WORDS) {
+        displayCleaned = '… ' + words.slice(-INTERIM_MAX_WORDS).join(' ');
+      }
+    }
+    const cleanedPart = displayCleaned
+      ? `<span class="vtt-cleaned">${esc(displayCleaned)}</span>`
       : '';
     const liveHtml = buildLiveHtml(liveText || '', showDot);
     const joiner   = cleanedPart && liveHtml ? ' ' : '';
@@ -226,6 +237,13 @@
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  // ── iOS detection ────────────────────────────────────────────────────────
+  // WakeLock absence is the primary signal (API-based); UA confirms Apple device.
+  // This avoids showing the warning on Android or desktop where WakeLock may also be absent.
+  function isIOSWithoutWakeLock() {
+    return !('wakeLock' in navigator) && /iPad|iPhone|iPod/.test(navigator.userAgent);
   }
 
   // ── Main init ────────────────────────────────────────────────────────────
@@ -480,6 +498,7 @@
     function appendCleanedChunk(text) {
       cleanedSoFar = cleanedSoFar ? cleanedSoFar.trimEnd() + '\n\n' + text : text;
       setCaption(cleanedSoFar);
+      try { localStorage.setItem(AUTOSAVE_KEY, targetEl.value); } catch {}
       if (isRecording) {
         // While recording the textarea stays hidden — the interim div is
         // the single display. Re-render so the just-cleaned chunk appears
@@ -633,6 +652,10 @@
       btnEl.innerHTML = STOP_SVG;
       if (labelEl)  labelEl.textContent  = 'Tap to stop';
       if (statusEl) statusEl.textContent = 'Listening\u2026';
+      if (isIOSWithoutWakeLock() && statusEl) {
+        statusEl.textContent = 'Keep screen on during recording';
+        setTimeout(() => { if (isRecording && statusEl) statusEl.textContent = 'Listening\u2026'; }, 4000);
+      }
       hintEl.classList.remove('vtt-visible');
       targetEl.classList.remove('vtt-textarea-highlight');
       targetEl.style.display  = 'none';
@@ -745,7 +768,13 @@
     });
 
     // Return control object for programmatic use
-    return { start: startVoice, stop: stopVoice, isRecording: () => isRecording };
+    return {
+      start:        startVoice,
+      stop:         stopVoice,
+      isRecording:  () => isRecording,
+      savedSession: () => { try { return localStorage.getItem(AUTOSAVE_KEY) || null; } catch { return null; } },
+      clearSaved:   () => { try { localStorage.removeItem(AUTOSAVE_KEY); } catch {} },
+    };
   }
 
   // ── Export ──────────────────────────────────────────────────────────────
