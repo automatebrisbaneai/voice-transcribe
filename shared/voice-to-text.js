@@ -1,5 +1,5 @@
 /**
- * Voice-to-Text v1.0
+ * Voice-to-Text v1.4
  * Drop-in voice transcription with blur interim display.
  *
  * Usage:
@@ -664,7 +664,8 @@
       btnEl.innerHTML = MIC_SVG;
       if (labelEl)  labelEl.textContent  = 'Talk to text';
 
-      const remainingRaw = pendingFinal.trim();
+      // Include latestInterim so words not yet finalized by the engine are still cleaned.
+      const remainingRaw = [pendingFinal.trim(), latestInterim.trim()].filter(Boolean).join(' ');
       // "Nothing heard" only if there's genuinely no captured speech — including
       // chunks already shipped to /clean but not yet returned (inFlightChunks)
       // or returned but waiting for in-order commit (pendingCommit).
@@ -676,15 +677,14 @@
         return;
       }
 
-      // Keep the interim visible while in-flight chunks finish resolving so the
-      // box stays populated rather than flashing empty. finaliseToTextarea() will
-      // switch to the editable textarea once every chunk has landed.
+      // Keep the interim visible — don't re-render here, just remove the pulsing
+      // dot so the display freezes on whatever the last recording render showed.
+      // Re-rendering risks producing empty content (e.g. if latestInterim has
+      // words that pendingFinal hasn't captured yet). finaliseToTextarea() will
+      // handle the switch to the editable textarea once all chunks have landed.
       postStopProcessing = true;
-      renderInterim(interimEl,
-        [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' '),
-        [inFlightJoined(), remainingRaw].filter(s => s && s.trim()).join(' '),
-        false // no dot — recording has stopped
-      );
+      const dotEl = interimEl.querySelector('.vtt-dot');
+      if (dotEl) dotEl.remove();
       btnEl.disabled = true;
 
       // Wrap all post-stop cleanup in try/finally so the button is ALWAYS
@@ -728,10 +728,10 @@
         btnEl.disabled = false;
       }
 
-      // Update interim to reflect the final chunk now cleaned (no longer blurred).
-      // Background chunks' .finally handlers will continue updating and will call
-      // finaliseToTextarea() when the last one lands.
-      if (postStopProcessing) {
+      // Update interim: show the just-cleaned text as unblurred prefix, keep any
+      // remaining in-flight chunks blurred. Only render if there are still background
+      // chunks pending — otherwise finaliseToTextarea() is about to hide the interim.
+      if (postStopProcessing && inFlightChunks.length > 0) {
         const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
         renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
       }
