@@ -230,7 +230,7 @@
                     </button>
                     <button id="sendBtn">
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                        Send to Claude
+                        Send to CroquetClaude
                     </button>
                 </div>
                 <button id="clearBtn">Start over</button>
@@ -239,7 +239,7 @@
     </div>
     <div id="sendModal">
         <div id="sendModalBox">
-            <h2>Send transcript to Claude</h2>
+            <h2>Send transcript to CroquetClaude</h2>
             <div class="modal-field">
                 <label for="senderName">Your name</label>
                 <input id="senderName" type="text" placeholder="Jane Smith" autocomplete="name">
@@ -392,7 +392,7 @@
                     body: JSON.stringify({ name, email, transcript }),
                 });
                 if (res.ok) {
-                    sendStatus.textContent = 'Sent! Claude will be in touch.';
+                    sendStatus.textContent = 'Sent! CroquetClaude will be in touch.';
                     sendStatus.className = 'success';
                     setTimeout(() => sendModal.classList.remove('open'), 2000);
                 } else {
