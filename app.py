@@ -97,7 +97,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "deepseek/deepseek-v4-lite"
+MODEL = "deepseek/deepseek-v4-flash"
 
 if not OPENROUTER_API_KEY:
     logger.warning(
