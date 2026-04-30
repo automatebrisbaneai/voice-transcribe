@@ -552,9 +552,18 @@
       const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
-        pendingCommit.set(id, '\u2026 ' + text);
-        // Advance committedSeq through any gap so tryFlushCommits can proceed.
+        // Drain any earlier chunks already settled before forcing the gap closed.
+        // Without this, an earlier chunk that lands in pendingCommit before its own
+        // timeout fires would be silently dropped when committedSeq jumps past it.
+        while (pendingCommit.has(committedSeq + 1)) {
+          committedSeq++;
+          const t = pendingCommit.get(committedSeq);
+          pendingCommit.delete(committedSeq);
+          appendCleanedChunk(t);
+        }
+        // Advance committedSeq through any remaining gap so tryFlushCommits can proceed.
         if (committedSeq < id - 1) committedSeq = id - 1;
+        pendingCommit.set(id, '\u2026 ' + text);
         tryFlushCommits();
       }, 15000);
 

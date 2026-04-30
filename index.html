@@ -255,7 +255,7 @@
             </div>
         </div>
     </div>
-    <div style="position:fixed;bottom:8px;right:10px;font-size:0.65rem;color:#cbd5e1;user-select:none;">v1.6</div>
+    <div style="position:fixed;bottom:8px;right:10px;font-size:0.65rem;color:#cbd5e1;user-select:none;">v1.7</div>
 
     <script src="/shared/voice-to-text.js"></script>
     <script>
@@ -286,6 +286,7 @@
             cleanedText.value = saved;
             cleanedText.style.display = '';
             recoverBanner.style.display = 'none';
+            vtt.clearSaved();
             checkResult();
         });
 
@@ -300,6 +301,7 @@
         function checkResult() {
             const hasContent = cleanedText.value.trim().length > 0;
             resultArea.style.display = hasContent ? 'flex' : 'none';
+            if (hasContent) autoResize();
         }
         setInterval(checkResult, 300);
         cleanedText.addEventListener('input', checkResult);
@@ -319,6 +321,9 @@
                     copyLabel.textContent = 'Copy';
                     copyBtn.classList.remove('copied');
                 }, 2000);
+            }).catch(() => {
+                copyLabel.textContent = 'Copy failed';
+                setTimeout(() => { copyLabel.textContent = 'Copy'; }, 2000);
             });
         });
 
@@ -331,7 +336,7 @@
             a.href     = url;
             a.download = 'transcript-' + new Date().toISOString().slice(0, 10) + '.txt';
             a.click();
-            URL.revokeObjectURL(url);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
         });
 
         // ── Textarea auto-resize ─────────────────────────────────────────────
@@ -340,12 +345,7 @@
             cleanedText.style.height = Math.max(130, cleanedText.scrollHeight) + 'px';
         }
         cleanedText.addEventListener('input', autoResize);
-        // Also resize when content is set programmatically
-        const _origCheckResult = checkResult;
-        function checkResult() {
-            _origCheckResult();
-            if (cleanedText.value.trim()) autoResize();
-        }
+        // checkResult (defined above) handles the programmatic-set case via setInterval.
 
         // ── Send to Claude modal ─────────────────────────────────────────────
         const sendBtn      = document.getElementById('sendBtn');
