@@ -6,7 +6,6 @@ import sys
 import time
 import unicodedata
 import uuid as uuid_lib
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
@@ -98,40 +97,6 @@ app = FastAPI(lifespan=lifespan)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = "deepseek/deepseek-v4-flash"
-
-if not OPENROUTER_API_KEY:
-    logger.warning(
-        "OPENROUTER_API_KEY not set — /clean will return 503",
-        extra={"event": "config_warning"},
-    )
-
-UTIL_PB_URL = os.environ.get("UTIL_PB_URL", "https://util.croquetwade.com")
-SUBMISSIONS_COLLECTION = "voice_submissions"
-
-# ── Rate limiting ────────────────────────────────────────────────────────
-# In-memory sliding-window per-IP throttle. FastAPI is single-threaded async
-# so no locks needed. Restarts wipe state (acceptable). Bounded by
-# active-IP × max-per-window timestamps.
-_rate_buckets: "defaultdict[str, list[float]]" = defaultdict(list)
-
-
-def _check_rate(key: str, max_per_window: int, window_s: int = 60) -> bool:
-    """Returns True if allowed, False if rate-limited."""
-    now = time.monotonic()
-    bucket = [t for t in _rate_buckets[key] if now - t < window_s]
-    if len(bucket) >= max_per_window:
-        _rate_buckets[key] = bucket
-        return False
-    bucket.append(now)
-    _rate_buckets[key] = bucket
-    return True
-
-
-def _client_ip_from(request: Request) -> str:
-    return (
-        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        or (request.client.host if request.client else "unknown")
-    )
 
 MIN_WORD_CHARS = 3
 MAX_CHUNK_CHARS = 2_000
@@ -225,12 +190,6 @@ _DICTIONARY_HINT = (
 
 class TranscriptRequest(BaseModel):
     text: str
-
-
-class SubmitRequest(BaseModel):
-    name: str
-    email: str = ""
-    transcript: str
 
 
 # ---------------------------------------------------------------------------
@@ -394,21 +353,16 @@ async def shared_file(filename: str):
     file_path = Path(__file__).parent / "shared" / filename
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
-    return Response(
-        content=file_path.read_text(encoding="utf-8"),
-        media_type=content_type,
-        headers={"Cache-Control": "no-store"},
-    )
+    return Response(content=file_path.read_text(encoding="utf-8"), media_type=content_type)
 
 
 @app.post("/clean")
 async def clean_transcript(request: Request, req: TranscriptRequest):
-    if not OPENROUTER_API_KEY:
-        raise HTTPException(status_code=503, detail="Service not configured.")
     client: httpx.AsyncClient = request.app.state.http
-    client_ip = _client_ip_from(request)
-    if not _check_rate(f"clean:{client_ip}", 30):
-        raise HTTPException(status_code=429, detail="Too many requests.")
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
     t_start = time.monotonic()
     raw = req.text or ""
 
@@ -535,51 +489,3 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
             },
         )
         raise HTTPException(status_code=502, detail="Transcript cleaning failed, please try again.")
-
-
-@app.post("/submit")
-async def submit_transcript(request: Request, req: SubmitRequest):
-    """Save a transcript submission to the utility PocketBase."""
-    client: httpx.AsyncClient = request.app.state.http
-    client_ip = _client_ip_from(request)
-    if not _check_rate(f"submit:{client_ip}", 5):
-        raise HTTPException(status_code=429, detail="Too many requests.")
-
-    name = (req.name or "").strip()
-    email = (req.email or "").strip()
-    transcript = (req.transcript or "").strip()
-
-    if not name:
-        raise HTTPException(status_code=422, detail="Name is required.")
-    if not transcript:
-        raise HTTPException(status_code=422, detail="Transcript is required.")
-    if len(transcript) > 200_000:
-        raise HTTPException(status_code=413, detail="Transcript too large.")
-    if len(name) > 200:
-        raise HTTPException(status_code=422, detail="Name too long.")
-    if len(email) > 320:
-        raise HTTPException(status_code=422, detail="Email too long.")
-
-    url = f"{UTIL_PB_URL}/api/collections/{SUBMISSIONS_COLLECTION}/records"
-    payload = {"sender_name": name, "sender_email": email, "transcript": transcript}
-
-    try:
-        res = await client.post(url, json=payload, timeout=httpx.Timeout(10.0), follow_redirects=True)
-        if res.status_code in (200, 201):
-            record = res.json()
-            logger.info("Submission saved", extra={"event": "submit_ok", "record_id": record.get("id")})
-            return {"ok": True, "id": record.get("id")}
-        else:
-            logger.error(
-                "PocketBase submission failed",
-                extra={"event": "submit_pb_error", "status": res.status_code, "body": res.text[:300]},
-            )
-            raise HTTPException(status_code=502, detail="Could not save submission — please try again.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(
-            "Submit unexpected error",
-            extra={"event": "submit_error", "exc_type": type(e).__name__, "exc_msg": str(e)},
-        )
-        raise HTTPException(status_code=502, detail="Could not save submission — please try again.")
