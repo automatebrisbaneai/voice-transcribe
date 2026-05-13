@@ -274,6 +274,7 @@ app.add_middleware(
     allow_origins=[
         "https://reply.croquetclaude.com",
         "https://talk.croquetwade.com",
+        "https://table.croquetclaude.com",
     ],
     allow_methods=["POST", "OPTIONS"],
     allow_headers=["Content-Type"],
