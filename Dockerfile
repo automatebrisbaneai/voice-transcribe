@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 WORKDIR /app
 # Use the pip-compile-generated lockfile with hash verification.
 # Every dep + transitive dep is pinned to a specific sha256, so a compromised

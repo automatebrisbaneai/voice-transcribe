@@ -385,6 +385,12 @@
     // a stale chunk from a previous recording can resolve against the new
     // session's reset state and pollute the new textarea content.
     let sessionId          = 0;
+    // Session-wide AbortController. Every chunk fetch in this session uses
+    // its signal; startVoice() aborts it before bumping sessionId so old
+    // in-flight fetches actually CLOSE their connections (instead of running
+    // to completion and dropping the result via the sessionId guard).
+    // Reduces wasted /clean calls and held TCP connections on rapid restarts.
+    let sessionAbortController = null;
     function inFlightJoined() {
       return inFlightChunks.map(c => c.text).join(' ');
     }
@@ -670,6 +676,9 @@
         method:  'POST',
         headers: postCleanHeaders(),
         body:    JSON.stringify({ text }),
+        // Aborted by startVoice() on session rotation so old fetches don't
+        // keep TCP connections open or bill the LLM for results we'll drop.
+        signal:  sessionAbortController ? sessionAbortController.signal : undefined,
       })
         .then(res => {
           // Treat 4xx/5xx as errors so the catch block handles status UX.
@@ -735,6 +744,15 @@
       pendingFinal       = '';
       pendingFinalCount  = 0;
       cleanedSoFar       = '';
+      // Abort any fetches still in flight from the PREVIOUS session before
+      // we rotate state. Their .then/.catch will fire with AbortError, hit
+      // the sessionId guard, and drop cleanly. Without this they'd run to
+      // completion holding TCP connections and billing the LLM for nothing.
+      if (sessionAbortController) {
+        try { sessionAbortController.abort(); } catch {}
+      }
+      sessionAbortController = new AbortController();
+
       postStopProcessing    = false;
       inFlightChunks        = [];
       inFlightSeq        = 0;
@@ -840,6 +858,13 @@
             const stopSession = sessionId;
             inFlightChunks.push({ id, text: remainingRaw });
             const controller = new AbortController();
+            // Cascade session-wide abort into this per-chunk controller so
+            // a session rotation cancels this fetch alongside the others.
+            if (sessionAbortController) {
+              sessionAbortController.signal.addEventListener('abort', () => {
+                try { controller.abort(); } catch {}
+              }, { once: true });
+            }
             const timeoutId = setTimeout(() => {
               if (stopSession !== sessionId) return; // stale session — drop
               if (settledChunks.has(id)) return;

@@ -401,7 +401,12 @@ async def request_size_middleware(request: Request, call_next):
     cl = request.headers.get("content-length")
     if cl is not None:
         try:
-            if int(cl) > MAX_REQUEST_BYTES:
+            cl_int = int(cl)
+            # Negative or oversize: reject. Negative CL is technically malformed
+            # but uvicorn/Traefik don't always normalise; the explicit < 0 check
+            # is defence-in-depth so a stray negative number can't trick the
+            # `> MAX_REQUEST_BYTES` comparison into letting the body through.
+            if cl_int < 0 or cl_int > MAX_REQUEST_BYTES:
                 return _too_large_response("content_length")
             # CL present and within budget — let downstream read normally.
             return await call_next(request)
@@ -452,7 +457,7 @@ app.add_middleware(
         "https://talk.croquetwade.com",
         "https://table.croquetclaude.com",
     ],
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", CLEAN_SHARED_KEY_HEADER],
     allow_credentials=False,
     max_age=86400,
