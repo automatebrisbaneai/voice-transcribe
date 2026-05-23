@@ -87,18 +87,11 @@ class TestChunkCap:
     def test_chunk_cap_accepts_at_2000_chars(self, client):
         """POST body of exactly 2000 chars must not return 413.
 
-        The app will try to call the LLM.  Without a live key it returns an
-        error status.  The important assertion is that the request is NOT
-        rejected by the chunk cap guard (which returns 413).
-
-        BUG REPORT (Phase 6): the generic exception handler at line ~460 of
-        app.py catches unexpected errors (e.g. connection error to OpenRouter
-        with no API key) and returns 500 instead of 502.  The 502 guard in the
-        happy path works, but this fallback branch raises 500.  The test
-        therefore accepts 200, 500, or 502 — all confirm the chunk was not
-        rejected by the size cap.  Ideally 500 should become 502 in the
-        generic handler too (fix: change HTTPException(status_code=500, ...)
-        to HTTPException(status_code=502, ...) in the except block).
+        The app will try to call the LLM. Without a live key the upstream call
+        fails; the handler maps both connection errors and bad-response paths
+        to 502. We accept 200/500/502 so the test is hermetic regardless of
+        whether the test runner has internet, an OpenCode key, or neither.
+        The point: NOT 413 — the chunk cap is at 2000 chars exclusive.
         """
         exact_text = "a" * 2000
         r = client.post("/clean", json={"text": exact_text})
@@ -131,36 +124,19 @@ class TestMetaDetector:
         )
 
     def test_meta_detector_first_person_speech(self):
-        """First-person PAST-tense speech behaviour against META_START.
+        """First-person speech that the LLM echoes back must NOT trip META_START.
 
-        BUG REPORT (Phase 6 / Python-JS divergence): the JS META_START regex
-        is tightened to require 'i (can|will|am happy|…)' so bare 'I went…'
-        does NOT trip it.  The Python backend uses _SUSPICIOUS_STARTS which
-        includes the bare prefix 'i ' (with a space), so 'i went home…' (after
-        lower()) DOES trip the guard in Python.
-
-        This is a false-positive divergence between the two layers: the JS
-        client-side guard would pass 'I went home' but the Python server-side
-        guard would flag it as meta and fall back to raw input.  In practice
-        this only matters if the LLM echoes the speaker's own first-person
-        narration back verbatim — which is the expected transcript-cleaning
-        output.
-
-        Fix path (not in scope here): tighten _SUSPICIOUS_STARTS in app.py to
-        match the JS pattern — require 'i will', 'i can', 'i am', etc. rather
-        than the bare 'i ' prefix.
-
-        This test asserts CURRENT (buggy) behaviour and documents the gap.
+        _META_START_RE is tightened to 'i (can|will|am happy|...)' so bare
+        'I went home...' (the kind of first-person narration users dictate)
+        passes through untouched. JS-side guard uses the same pattern.
         """
         result = _looks_like_meta_response(
             "I went home and made tea",
             "I went home and made tea.",
         )
-        # Bug 2 fixed: _META_START_RE requires 'i (can|will|am happy|…)' so bare
-        # 'I went…' no longer trips the guard.  Now matches tightened JS behaviour.
         assert result is False, (
-            "Expected False: 'I went…' must not trip _META_START_RE after Bug 2 fix. "
-            "Guard now requires 'i can/will/am happy/…' not bare 'i '."
+            "Expected False: 'I went...' must not trip _META_START_RE. "
+            "Guard requires 'i can/will/am happy/...' not the bare 'i ' prefix."
         )
 
 
@@ -281,21 +257,27 @@ class TestInputNormalization:
 # ---------------------------------------------------------------------------
 class TestSharedAllowlist:
     def test_shared_allowlist_voice_to_text_js(self, client):
-        """GET /shared/voice-to-text.js must return 200 (if file present) or 404 (not 500)."""
+        """GET /shared/voice-to-text.js MUST return 200.
+
+        SHARED_DIR resolver checks both the in-app shared/ (Docker layout) and
+        the parent apps/shared/ (dev layout); the file is shipped in the deploy
+        submodule. A 404 here means packaging is broken — root page is dead.
+        """
         r = client.get("/shared/voice-to-text.js")
-        assert r.status_code in (200, 404), (
-            f"Expected 200 or 404 for allowlisted file, got {r.status_code}"
+        assert r.status_code == 200, (
+            f"Expected 200 for /shared/voice-to-text.js, got {r.status_code}. "
+            f"Container packaging or SHARED_DIR resolver is broken."
         )
-        if r.status_code == 200:
-            assert "javascript" in r.headers.get("content-type", ""), (
-                "Expected application/javascript content-type"
-            )
+        assert "javascript" in r.headers.get("content-type", ""), (
+            "Expected application/javascript content-type"
+        )
 
     def test_shared_allowlist_dictionary(self, client):
-        """GET /shared/croquet-dictionary.json must return 200 (if file present) or 404."""
+        """GET /shared/croquet-dictionary.json MUST return 200."""
         r = client.get("/shared/croquet-dictionary.json")
-        assert r.status_code in (200, 404), (
-            f"Expected 200 or 404 for allowlisted JSON, got {r.status_code}"
+        assert r.status_code == 200, (
+            f"Expected 200 for /shared/croquet-dictionary.json, got {r.status_code}. "
+            f"Croquet vocab will be missing from LLM prompts if this 404s."
         )
 
     def test_shared_allowlist_rejects_unknown(self, client):
@@ -403,8 +385,8 @@ class TestUpstreamErrors:
         return mock
 
     def test_upstream_500_returns_generic_502(self, client):
-        """OpenRouter 500 → /clean must return 502 with generic message (no upstream leak)."""
-        error_body = {"error": {"message": "OpenRouter internal error", "code": 500}}
+        """Upstream 500 → /clean must return 502 with generic message (no upstream leak)."""
+        error_body = {"error": {"message": "Upstream internal error", "code": 500}}
 
         async def _post(*args, **kwargs):
             r = MagicMock()
@@ -425,11 +407,11 @@ class TestUpstreamErrors:
             f"Expected generic error message, got: {body.get('detail')!r}"
         )
         # No upstream details must leak into the response
-        assert "OpenRouter" not in r.text, "Upstream error message must not leak to client"
+        assert "Upstream" not in r.text, "Upstream error message must not leak to client"
         assert "internal error" not in r.text.lower(), "Upstream error details must not leak"
 
     def test_upstream_malformed_json_returns_502(self, client):
-        """OpenRouter returns un-parseable body → /clean returns 502 (not uncaught 500)."""
+        """Upstream returns un-parseable body → /clean returns 502 (not uncaught 500)."""
         async def _post(*args, **kwargs):
             r = MagicMock()
             r.status_code = 200
@@ -449,7 +431,7 @@ class TestUpstreamErrors:
         )
 
     def test_upstream_timeout_returns_502(self, client):
-        """httpx.ReadTimeout from OpenRouter → /clean returns 502."""
+        """httpx.ReadTimeout from upstream → /clean returns 502."""
         async def _post(*args, **kwargs):
             raise httpx.ReadTimeout("timed out", request=None)
 
@@ -640,6 +622,155 @@ class TestIndexRender:
             )
         finally:
             appmod.CLEAN_SHARED_KEY = original
+
+
+# ---------------------------------------------------------------------------
+# CORS preflight allows X-Talk-Key
+# ---------------------------------------------------------------------------
+class TestCorsPreflightXTalkKey:
+    def test_preflight_allows_x_talk_key_header(self, client):
+        """Browser preflight for cross-origin POST must permit X-Talk-Key.
+
+        Without this, no cross-origin caller can ever ship the auth header —
+        the browser blocks the actual request before it leaves the machine.
+        """
+        r = client.options(
+            "/clean",
+            headers={
+                "Origin": "https://table.croquetclaude.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,x-talk-key",
+            },
+        )
+        assert r.status_code == 200, (
+            f"Expected 200 on preflight, got {r.status_code}. CORS misconfigured."
+        )
+        allow_headers = r.headers.get("access-control-allow-headers", "").lower()
+        assert "x-talk-key" in allow_headers, (
+            f"X-Talk-Key missing from allow-headers ({allow_headers!r}). "
+            f"Cross-origin auth gate will never work."
+        )
+
+    def test_preflight_allows_known_origins(self, client):
+        """Each of the three allowlisted origins must get back its own Origin echoed."""
+        for origin in (
+            "https://reply.croquetclaude.com",
+            "https://talk.croquetwade.com",
+            "https://table.croquetclaude.com",
+        ):
+            r = client.options(
+                "/clean",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                },
+            )
+            assert r.status_code == 200, f"Origin {origin}: got {r.status_code}"
+            assert r.headers.get("access-control-allow-origin") == origin, (
+                f"Origin {origin} not echoed back; got "
+                f"{r.headers.get('access-control-allow-origin')!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Request-size middleware rejects oversize bodies BEFORE FastAPI parses them
+# ---------------------------------------------------------------------------
+class TestRequestSizeMiddleware:
+    def test_oversized_content_length_rejected_before_parse(self, client):
+        """Content-Length over MAX_REQUEST_BYTES returns 413 without reaching the route.
+
+        The 8KB cap blocks the unauthenticated DoS path: without this, FastAPI
+        would parse a 50MB JSON envelope before the route's chunk-cap check fired.
+        """
+        import app as appmod
+        # Build a body that's just over the cap; doesn't matter that it isn't
+        # valid JSON — the middleware rejects on Content-Length alone.
+        big_body = "x" * (appmod.MAX_REQUEST_BYTES + 1)
+        r = client.post(
+            "/clean",
+            content=big_body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 413, (
+            f"Expected 413 for oversize body, got {r.status_code}. "
+            f"DoS path is open."
+        )
+        assert r.json() == {"detail": "Payload too large"}
+
+    def test_undersized_body_passes_middleware(self, client):
+        """Bodies under the cap still reach the route (where auth/handler take over)."""
+        r = client.post(
+            "/clean",
+            json={"text": "the player struck the ball cleanly"},
+        )
+        assert r.status_code != 413, (
+            f"Small body should NOT be rejected by size middleware, got {r.status_code}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit eviction drops stale one-shot IPs
+# ---------------------------------------------------------------------------
+class TestRateLimitEviction:
+    def test_global_prune_drops_stale_buckets(self):
+        """Buckets whose newest timestamp is older than the window cutoff
+        get evicted on the periodic prune — not just empty deques.
+        """
+        import app as appmod
+        import time as time_mod
+        from collections import deque
+        appmod._rate_buckets.clear()
+        appmod._rate_request_count = 0
+        # Populate a one-shot stale IP: single timestamp older than the window.
+        stale_ts = time_mod.monotonic() - (appmod.RATE_LIMIT_WINDOW_S + 30)
+        appmod._rate_buckets["1.2.3.4"] = deque([stale_ts])
+        appmod._rate_buckets["5.6.7.8"] = deque([stale_ts, stale_ts + 1])
+        # Force the prune trigger (every 500th request).
+        appmod._rate_request_count = 499
+        appmod._check_rate_limit("active.ip")
+        assert "1.2.3.4" not in appmod._rate_buckets, (
+            "Stale one-shot bucket must be evicted during periodic prune."
+        )
+        assert "5.6.7.8" not in appmod._rate_buckets, (
+            "Stale multi-timestamp bucket must be evicted too."
+        )
+        # The active IP that triggered the prune must still be present.
+        assert "active.ip" in appmod._rate_buckets
+
+
+# ---------------------------------------------------------------------------
+# Exception handler carries the correlation ID and renders generic detail
+# ---------------------------------------------------------------------------
+class TestExceptionHandlerCorrelation:
+    def test_exception_handler_uses_request_state_id(self):
+        """Unhandled exceptions log with the right request_id and respond 500
+        with a generic body — no traceback / internal paths leaked to clients.
+        """
+        from fastapi import FastAPI, Request
+        from app import unhandled_exception_handler
+
+        # Fake a request whose state already has a pinned request_id (matching
+        # the middleware contract). The handler must read it.
+        class _State:
+            request_id = "abc123def456"
+        class _Url:
+            path = "/test"
+        class _FakeReq:
+            state = _State()
+            url = _Url()
+
+        import asyncio
+        response = asyncio.run(unhandled_exception_handler(
+            _FakeReq(), RuntimeError("intentional test failure"),
+        ))
+        assert response.status_code == 500
+        assert b"intentional test failure" not in response.body, (
+            "Internal exception text must not leak into the client response."
+        )
+        import json as _json
+        body = _json.loads(response.body)
+        assert body == {"detail": "An unexpected error occurred."}
 
 
 # ---------------------------------------------------------------------------

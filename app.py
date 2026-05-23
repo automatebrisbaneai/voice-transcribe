@@ -114,6 +114,12 @@ RATE_LIMIT_WINDOW_S = 60.0
 MIN_WORD_CHARS = 3
 MAX_CHUNK_CHARS = 2_000
 
+# Hard cap on the raw request body BEFORE FastAPI/Pydantic parses it.
+# MAX_CHUNK_CHARS=2000 is the application-layer limit on the cleaned text;
+# the JSON envelope adds a small fixed overhead, so 8KB gives headroom without
+# letting an attacker stream a 50MB body just to land in a 413 reply.
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "8192"))
+
 # ---------------------------------------------------------------------------
 # Per-IP rate limit — sliding window in process memory.
 #
@@ -142,11 +148,17 @@ def _check_rate_limit(ip: str) -> bool:
     if len(bucket) >= RATE_LIMIT_PER_MIN:
         return False
     bucket.append(now)
-    # Periodic prune of fully-emptied buckets so the dict doesn't grow without bound.
+    # Periodic global prune. Drop ANY bucket whose newest timestamp is older
+    # than the window cutoff — covers both empty deques (handled by the same
+    # condition since max() raises ValueError on empty, guarded below) and
+    # one-shot IPs whose single old timestamp would otherwise leak forever.
     _rate_request_count += 1
     if _rate_request_count % 500 == 0:
-        empty_keys = [k for k, b in _rate_buckets.items() if not b]
-        for k in empty_keys:
+        stale_keys = [
+            k for k, b in _rate_buckets.items()
+            if not b or b[-1] < cutoff
+        ]
+        for k in stale_keys:
             del _rate_buckets[k]
     return True
 
@@ -217,9 +229,28 @@ def _looks_like_meta_response(raw_input: str, model_output: str) -> bool:
     return False
 
 
+def _resolve_shared_dir() -> Path:
+    """Find the shared/ directory wherever it actually lives.
+
+    Docker layout: ./shared/ is inside the app dir (Dockerfile `COPY . .` from
+    the deploy submodule which has its own shared/).
+    Dev layout: shared/ is a sibling at apps/shared/ (the canonical source).
+    Falls back to the Docker path so `shared_file` returns clean 404s rather
+    than tracebacks when neither exists.
+    """
+    here = Path(__file__).parent
+    for candidate in (here / "shared", here.parent / "shared"):
+        if candidate.is_dir():
+            return candidate
+    return here / "shared"
+
+
+SHARED_DIR = _resolve_shared_dir()
+
+
 def _load_croquet_dictionary() -> dict:
-    """Load croquet-dictionary.json from shared/ — app dir only (Docker layout)."""
-    p = Path(__file__).parent / "shared" / "croquet-dictionary.json"
+    """Load croquet-dictionary.json from whichever shared/ directory resolved."""
+    p = SHARED_DIR / "croquet-dictionary.json"
     if p.is_file():
         return json.loads(p.read_text(encoding="utf-8"))
     return {"terms": [], "players": []}
@@ -259,6 +290,9 @@ async def correlation_id_middleware(request: Request, call_next):
     """
     request_id = request.headers.get("x-request-id") or uuid_lib.uuid4().hex[:12]
     token = REQUEST_ID.set(request_id)
+    # Pin on request.state too, so the global exception handler can read it
+    # AFTER this middleware's finally has reset the ContextVar.
+    request.state.request_id = request_id
 
     path = request.url.path
     method = request.method
@@ -309,15 +343,49 @@ async def correlation_id_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
-# Phase 8: CORS — allow reply.croquetclaude.com to POST to /clean
+# Body-size guard — rejects oversized requests BEFORE FastAPI/Pydantic parses
+# the body. Without this, a hostile client can stream a 10MB JSON envelope and
+# we pay the parse cost before the route handler's chunk-cap check runs.
+# Runs AFTER correlation_id middleware (so logged with request_id) and BEFORE
+# the route, courtesy of FastAPI's LIFO middleware stack and the registration
+# order at this point in the file.
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def request_size_middleware(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > MAX_REQUEST_BYTES:
+                logger.warning(
+                    "Request rejected — body too large",
+                    extra={
+                        "event": "request_too_large",
+                        "content_length": cl,
+                        "path": request.url.path,
+                    },
+                )
+                from fastapi.responses import Response as _Response
+                return _Response(
+                    content=json.dumps({"detail": "Payload too large"}),
+                    status_code=413,
+                    media_type="application/json",
+                )
+        except ValueError:
+            # Bad Content-Length string → let downstream handle it.
+            pass
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# CORS — explicit origin allowlist so only the three known sites cross-fetch
+# /clean. allow_credentials=False only blocks browser-managed credentials
+# (cookies, HTTP auth); custom headers like X-Talk-Key still pass when listed
+# in allow_headers. Without X-Talk-Key in the list, browser preflight blocks
+# any cross-origin POST that tries to send it.
 #
-# Explicit origin allowlist (NOT "*") so only the two known origins get the
-# Access-Control-Allow-Origin header.  allow_credentials=False means the
-# browser never sends cookies or auth headers cross-origin.
-#
-# Middleware registration order (Starlette/FastAPI LIFO): this call is the
-# LAST add_middleware registered, so it becomes the outermost layer and
-# handles OPTIONS preflight before correlation_id_middleware runs.
+# Middleware registration order (Starlette/FastAPI LIFO): this is the LAST
+# middleware registered, so it wraps everything else and handles OPTIONS
+# preflight before correlation_id_middleware / request_size_middleware run.
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -327,7 +395,7 @@ app.add_middleware(
         "https://table.croquetclaude.com",
     ],
     allow_methods=["POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", CLEAN_SHARED_KEY_HEADER],
     allow_credentials=False,
     max_age=86400,
 )
@@ -339,10 +407,14 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     from fastapi.responses import Response as _Response
+    # By the time this runs, the middleware's `finally` has already reset the
+    # REQUEST_ID ContextVar — so we read the pinned-on-state copy instead.
+    request_id = getattr(request.state, "request_id", "")
     logger.error(
         "Unhandled exception",
         extra={
             "event": "exception",
+            "request_id": request_id,
             "exc_type": type(exc).__name__,
             "exc_msg": str(exc),
             "path": request.url.path,
@@ -460,8 +532,7 @@ async def shared_file(filename: str):
     if filename not in SHARED_FILES:
         raise HTTPException(status_code=404, detail="Not found")
     content_type = SHARED_FILES[filename]
-    # Docker layout: shared/ lives inside the app directory at /app/shared/.
-    file_path = Path(__file__).parent / "shared" / filename
+    file_path = SHARED_DIR / filename
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     return Response(content=file_path.read_text(encoding="utf-8"), media_type=content_type)
