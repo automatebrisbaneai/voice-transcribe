@@ -397,9 +397,16 @@ async def request_size_middleware(request: Request, call_next):
             media_type="application/json",
         )
 
-    # Fast path: declared Content-Length.
+    # Fast path: declared Content-Length AND no chunked transfer-encoding.
+    # Per RFC 7230, when both Content-Length and Transfer-Encoding are
+    # present, TE wins for framing. A hostile caller can send `CL:0` plus
+    # `TE:chunked` with an oversized chunked body; the CL fast path would
+    # have let it through unread before this guard. When TE is present we
+    # always fall through to the stream-read path so the actual bytes get
+    # tallied against the cap. (Codex round-4 finding, 2026-05-24.)
     cl = request.headers.get("content-length")
-    if cl is not None:
+    te = request.headers.get("transfer-encoding", "").lower()
+    if cl is not None and "chunked" not in te:
         try:
             cl_int = int(cl)
             # Negative or oversize: reject. Negative CL is technically malformed
@@ -408,7 +415,7 @@ async def request_size_middleware(request: Request, call_next):
             # `> MAX_REQUEST_BYTES` comparison into letting the body through.
             if cl_int < 0 or cl_int > MAX_REQUEST_BYTES:
                 return _too_large_response("content_length")
-            # CL present and within budget — let downstream read normally.
+            # CL present, no chunked TE, within budget — let downstream read.
             return await call_next(request)
         except ValueError:
             # Malformed CL header — fall through to the stream-read guard

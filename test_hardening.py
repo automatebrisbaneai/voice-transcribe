@@ -726,6 +726,60 @@ class TestRequestSizeMiddleware:
             f"Small body should NOT be rejected by size middleware, got {r.status_code}"
         )
 
+    def test_mixed_content_length_and_chunked_te_rejected(self):
+        """A hostile caller sets `Content-Length: 0` AND `Transfer-Encoding: chunked`
+        with an oversized streamed body. RFC 7230 says TE wins for framing, so the
+        body is the chunked stream — not the declared CL=0. If the middleware took
+        the CL fast path on the false CL header, the oversized body would slip past.
+        """
+        import asyncio
+        import app as appmod
+
+        async def _run():
+            big_chunk = b"x" * 4096
+            chunks_to_send = (appmod.MAX_REQUEST_BYTES // 4096) + 2
+            chunk_iter = iter(range(chunks_to_send))
+
+            async def receive():
+                try:
+                    next(chunk_iter)
+                    return {"type": "http.request", "body": big_chunk, "more_body": True}
+                except StopIteration:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+            sent = []
+            async def send(msg):
+                sent.append(msg)
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/clean",
+                "raw_path": b"/clean",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", b"0"),      # Liar
+                    (b"transfer-encoding", b"chunked"),  # The truth
+                ],
+                "client": ("127.0.0.1", 12346),
+                "server": ("testserver", 80),
+            }
+            await appmod.app(scope, receive, send)
+            return sent
+
+        messages = asyncio.run(_run())
+        start = next((m for m in messages if m["type"] == "http.response.start"), None)
+        assert start is not None
+        assert start["status"] == 413, (
+            f"Mixed CL+TE oversize body must 413 (TE wins per RFC 7230), "
+            f"got {start['status']}. Round-4 critical regressed."
+        )
+
     def test_chunked_transfer_encoding_bypass_closed(self):
         """No Content-Length + oversized streamed body must still 413.
 
