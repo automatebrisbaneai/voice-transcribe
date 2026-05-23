@@ -1,24 +1,43 @@
 /**
- * Voice-to-Text v1.5
+ * Voice-to-Text v1.6.0
+ *
+ * Single-source voice library. Canonical deployment lives at
+ * https://talk.croquetwade.com/shared/voice-to-text.js — every consumer
+ * page loads this URL directly so a fix here propagates to every site at
+ * once, with no per-app sync to maintain.
+ *
  * Drop-in voice transcription with blur interim display.
  *
- * Usage:
+ * Usage (cross-domain, recommended):
+ *   <script src="https://talk.croquetwade.com/shared/voice-to-text.js"></script>
+ *
+ * Usage (same-origin, only when the page is served from talk.croquetwade.com):
  *   <script src="/shared/voice-to-text.js"></script>
+ *
  *   <script>
  *     VoiceToText.init({
- *       target:   'captionField',       // textarea ID to fill
+ *       target:   'captionField',       // textarea ID or DOM node to fill
  *       button:   'voiceBtn',           // mic button ID (optional — auto-creates if missing)
  *       interim:  'interim',            // interim display div ID (optional — auto-creates if missing)
  *       status:   'voiceStatus',        // status text element ID (optional)
  *       label:    'voiceLabel',         // label element ID (optional)
  *       cleanUrl: '/clean',             // POST endpoint for transcript cleanup (default: /clean)
- *       lang:     'en-AU',             // recognition language (default: en-AU)
+ *       lang:     'en-AU',              // recognition language (default: en-AU)
  *     });
+ *
+ *     // Optional: send auth or correlation headers to the /clean endpoint.
+ *     // Only the keys in ALLOWED_HEADER_NAMES are accepted; others are
+ *     // dropped with a console warning. Currently allows: X-Talk-Key.
+ *     window.VoiceToText.version;       // -> "1.6.0"
  *   </script>
  */
 
 (function () {
   'use strict';
+
+  // Public version constant — bumped on every release. Consumers can
+  // feature-detect against this if they pin specific behaviour.
+  const VOICE_TO_TEXT_VERSION = '1.6.0';
 
   // ── Inject CSS once ──────────────────────────────────────────────────────
   const STYLE_ID = 'vtt-styles';
@@ -129,9 +148,18 @@
 
   // ── Chunk timing ────────────────────────────────────────────────────────
   // Ship a progressive chunk to /clean when the speaker pauses for PAUSE_MS.
-  // MAX_CHUNK_MS is a safety fallback so continuous talkers still see output.
+  // 2500ms was chosen empirically: long enough to outlast a thinking pause
+  // (~1.5s for most speakers), short enough that the user sees cleaned text
+  // appear within a few seconds of finishing a sentence.
   const PAUSE_MS       = 2500;
+  // MAX_CHUNK_MS is the safety fallback for continuous talkers — without it,
+  // a 5-minute monologue would never ship a chunk because PAUSE_MS never
+  // fires. 120s keeps the chunk size manageable for the LLM (~250 words at
+  // normal speaking rate) without sacrificing single-shot accuracy.
   const MAX_CHUNK_MS   = 120000;
+  // Tick frequency for the chunk-ship watchdog. 500ms is below human-
+  // perception threshold so a chunk feels like it ships "as soon as you stop"
+  // without thrashing the event loop.
   const TICK_MS        = 500;
   // Minimum finalised-text length before a pause will flush a chunk.
   // A thinking "um" with an accidental final-result flush is noise the
@@ -241,11 +269,28 @@
 
   // ── Header injection ────────────────────────────────────────────────────
   // Page can set window.VTT_EXTRA_HEADERS = {"X-Talk-Key": "…"} before this
-  // library loads to send extra headers on every /clean POST. Empty/missing
-  // is the default (no extra headers, full backward compatibility).
+  // library loads to send extra headers on every /clean POST.
+  //
+  // SECURITY: only ALLOWED_HEADER_NAMES below are accepted. Without this
+  // whitelist, any script running before voice-to-text.js (third-party
+  // widget, browser extension, malicious injection) could set
+  // VTT_EXTRA_HEADERS = {"Authorization": "Bearer <stolen>"} and exfiltrate
+  // sensitive headers via every transcript POST. The whitelist exists
+  // precisely because this library will eventually load cross-domain into
+  // consumer pages we don't control.
+  const ALLOWED_HEADER_NAMES = new Set(['X-Talk-Key']);
   function extraHeaders() {
     const h = window.VTT_EXTRA_HEADERS;
-    return (h && typeof h === 'object') ? h : {};
+    if (!h || typeof h !== 'object') return {};
+    const filtered = {};
+    for (const k of Object.keys(h)) {
+      if (ALLOWED_HEADER_NAMES.has(k)) {
+        filtered[k] = h[k];
+      } else {
+        try { console.warn('[VoiceToText] ignored disallowed header:', k); } catch {}
+      }
+    }
+    return filtered;
   }
   function postCleanHeaders() {
     return Object.assign({ 'Content-Type': 'application/json' }, extraHeaders());
@@ -334,6 +379,12 @@
     // chunk would land in pendingCommit under a seq already passed by
     // committedSeq, and never flush — wedging the transcript forever.
     let settledChunks      = new Set();
+    // Monotonic session counter — every startVoice() bumps it. Every chunk
+    // closure captures the value at creation time; callbacks bail when the
+    // captured session no longer matches the active one. Without this guard,
+    // a stale chunk from a previous recording can resolve against the new
+    // session's reset state and pollute the new textarea content.
+    let sessionId          = 0;
     function inFlightJoined() {
       return inFlightChunks.map(c => c.text).join(' ');
     }
@@ -585,6 +636,11 @@
       // with meta-chatter like "please provide the transcript".
       if (!text || !/[a-zA-Z]/.test(text)) return;
 
+      // Capture session at chunk creation. Every async callback below checks
+      // mySession === sessionId so stale fetches from a previous recording
+      // cannot pollute the new session's pendingCommit / textarea.
+      const mySession = sessionId;
+
       // noCleanup mode: cleanUrl is null/'' — bypass all /clean fetches.
       if (!cleanUrl) {
         const id = ++inFlightSeq;
@@ -604,6 +660,7 @@
       // settledChunks Set lets the late-returning fetch short-circuit when it
       // finally resolves, so no chunk is ever lost OR double-appended.
       const timeoutId = setTimeout(() => {
+        if (mySession !== sessionId) return; // stale session — drop silently
         if (settledChunks.has(id)) return;
         forceSettleUpTo(id);
         tryFlushCommits();
@@ -621,6 +678,7 @@
           return res.json();
         })
         .then(data => {
+          if (mySession !== sessionId) return; // stale session — drop
           if (settledChunks.has(id)) return; // timeout already settled this chunk
           clearTimeout(timeoutId);
           settledChunks.add(id);
@@ -634,6 +692,7 @@
           tryFlushCommits();
         })
         .catch(err => {
+          if (mySession !== sessionId) return; // stale session \u2014 drop
           if (settledChunks.has(id)) return; // timeout already settled this chunk
           clearTimeout(timeoutId);
           settledChunks.add(id);
@@ -641,13 +700,17 @@
           // was paused (413 payload too large, 429 rate limit, network drop).
           if (statusEl) {
             statusEl.textContent = 'Cleanup paused \u2014 raw text shown.';
-            setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+            setTimeout(() => {
+              if (mySession !== sessionId) return;
+              if (statusEl) statusEl.textContent = '';
+            }, 3000);
           }
           // Graceful fallback: use raw text if the clean request fails.
           pendingCommit.set(id, text);
           tryFlushCommits();
         })
         .finally(() => {
+          if (mySession !== sessionId) return; // stale session \u2014 drop
           // afterChunkSettled runs exactly once per chunk regardless of
           // outcome (resolve / reject / timeout) so inFlightChunks never
           // leaks and post-stop finalisation runs at the right moment.
@@ -678,6 +741,10 @@
       committedSeq       = 0;
       pendingCommit      = new Map();
       settledChunks      = new Set();
+      // Bump the session counter LAST so any closure capturing it at this
+      // point sees the new value. Stale callbacks from previous sessions
+      // captured the old value and will early-return on the mismatch check.
+      sessionId++;
       isRecording        = true;
       lastSpeechAt       = Date.now();
       if ('wakeLock' in navigator) {
@@ -770,9 +837,11 @@
           // everything has landed, no stopVoiceFetchPending bookkeeping.
           if (cleanUrl) {
             const id = ++inFlightSeq;
+            const stopSession = sessionId;
             inFlightChunks.push({ id, text: remainingRaw });
             const controller = new AbortController();
             const timeoutId = setTimeout(() => {
+              if (stopSession !== sessionId) return; // stale session — drop
               if (settledChunks.has(id)) return;
               controller.abort();
               forceSettleUpTo(id);
@@ -786,10 +855,17 @@
                 body:    JSON.stringify({ text: remainingRaw }),
                 signal:  controller.signal,
               });
-              if (!settledChunks.has(id)) {
+              if (stopSession !== sessionId) {
+                // Session rotated under us while awaiting — drop the result.
                 clearTimeout(timeoutId);
-                settledChunks.add(id);
+              } else if (!settledChunks.has(id)) {
+                clearTimeout(timeoutId);
                 const data = res.ok ? await res.json() : null;
+                // Re-check after second await: another callback could have
+                // settled this id while we were parsing.
+                if (stopSession !== sessionId) return;
+                if (settledChunks.has(id)) return;
+                settledChunks.add(id);
                 const cleaned = data && data.cleaned;
                 const result = (cleaned && !looksLikeMetaResponse(remainingRaw, cleaned))
                   ? cleaned : remainingRaw;
@@ -798,7 +874,9 @@
                 afterChunkSettled(id);
               }
             } catch {
-              if (!settledChunks.has(id)) {
+              if (stopSession !== sessionId) {
+                clearTimeout(timeoutId);
+              } else if (!settledChunks.has(id)) {
                 clearTimeout(timeoutId);
                 settledChunks.add(id);
                 pendingCommit.set(id, remainingRaw);
@@ -848,5 +926,5 @@
   }
 
   // ── Export ──────────────────────────────────────────────────────────────
-  window.VoiceToText = { init };
+  window.VoiceToText = { init, version: VOICE_TO_TEXT_VERSION };
 })();

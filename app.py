@@ -37,6 +37,11 @@ class _JsonFormatter(logging.Formatter):
         "lineno", "funcName", "created", "msecs", "relativeCreated",
         "thread", "threadName", "processName", "process", "message",
         "taskName",
+        # uvicorn access-log records carry color_message (ANSI escape codes).
+        # Uvicorn logger propagation is currently disabled, so this never
+        # fires today — but skip it defensively so re-enabling propagation
+        # later doesn't pollute our JSON with terminal escape sequences.
+        "color_message",
     })
 
     def format(self, record: logging.LogRecord) -> str:
@@ -249,11 +254,29 @@ SHARED_DIR = _resolve_shared_dir()
 
 
 def _load_croquet_dictionary() -> dict:
-    """Load croquet-dictionary.json from whichever shared/ directory resolved."""
+    """Load croquet-dictionary.json with graceful fallback.
+
+    Runs at import time, so a malformed file MUST NOT crash the boot.
+    If JSON is bad (trailing comma after a manual edit, truncated write),
+    log loudly and return an empty dictionary — the app still serves
+    traffic, just without croquet vocab hints in the LLM prompt.
+    """
     p = SHARED_DIR / "croquet-dictionary.json"
-    if p.is_file():
+    if not p.is_file():
+        return {"terms": [], "players": []}
+    try:
         return json.loads(p.read_text(encoding="utf-8"))
-    return {"terms": [], "players": []}
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(
+            "croquet-dictionary.json failed to load — serving without it",
+            extra={
+                "event": "dictionary_load_failed",
+                "path": str(p),
+                "exc_type": type(e).__name__,
+                "exc_msg": str(e)[:200],
+            },
+        )
+        return {"terms": [], "players": []}
 
 
 _DICTIONARY = _load_croquet_dictionary()
@@ -344,35 +367,70 @@ async def correlation_id_middleware(request: Request, call_next):
 
 # ---------------------------------------------------------------------------
 # Body-size guard — rejects oversized requests BEFORE FastAPI/Pydantic parses
-# the body. Without this, a hostile client can stream a 10MB JSON envelope and
-# we pay the parse cost before the route handler's chunk-cap check runs.
-# Runs AFTER correlation_id middleware (so logged with request_id) and BEFORE
-# the route, courtesy of FastAPI's LIFO middleware stack and the registration
-# order at this point in the file.
+# the body. Two layers:
+#   1. Fast path: trust Content-Length when present. 99.9% of clients send it.
+#   2. Stream-read fallback: when Content-Length is absent (chunked transfer
+#      encoding, HTTP/2 streamed requests), drain the body ourselves with a
+#      running tally and 413 the moment cumulative bytes cross the cap.
+#      Then rebuild the receive callable so the downstream handler still gets
+#      the body it expects.
+# Without #2, any client sending `Transfer-Encoding: chunked` bypasses the cap
+# and streams unbounded bytes straight into FastAPI's Pydantic parse step.
+# Runs AFTER correlation_id middleware (registered earlier in this file).
 # ---------------------------------------------------------------------------
 @app.middleware("http")
 async def request_size_middleware(request: Request, call_next):
+    from fastapi.responses import Response as _Response
+
+    def _too_large_response(reason: str) -> _Response:
+        logger.warning(
+            "Request rejected — body too large",
+            extra={
+                "event": "request_too_large",
+                "reason": reason,
+                "path": request.url.path,
+            },
+        )
+        return _Response(
+            content=json.dumps({"detail": "Payload too large"}),
+            status_code=413,
+            media_type="application/json",
+        )
+
+    # Fast path: declared Content-Length.
     cl = request.headers.get("content-length")
     if cl is not None:
         try:
             if int(cl) > MAX_REQUEST_BYTES:
-                logger.warning(
-                    "Request rejected — body too large",
-                    extra={
-                        "event": "request_too_large",
-                        "content_length": cl,
-                        "path": request.url.path,
-                    },
-                )
-                from fastapi.responses import Response as _Response
-                return _Response(
-                    content=json.dumps({"detail": "Payload too large"}),
-                    status_code=413,
-                    media_type="application/json",
-                )
+                return _too_large_response("content_length")
+            # CL present and within budget — let downstream read normally.
+            return await call_next(request)
         except ValueError:
-            # Bad Content-Length string → let downstream handle it.
+            # Malformed CL header — fall through to the stream-read guard
+            # rather than trusting an unparseable number.
             pass
+
+    # Slow path: no/unparseable Content-Length (chunked TE, HTTP/2 stream).
+    # Drain the body ourselves with a running tally. As soon as we cross the
+    # cap, 413 — don't keep reading more bytes than necessary to decide.
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > MAX_REQUEST_BYTES:
+            return _too_large_response("streamed_overflow")
+
+    # Within budget — rebuild a receive callable that replays the body we
+    # already drained, then hand off to the route handler. The route's
+    # `await request.body()` (via Pydantic) will see exactly this body.
+    body_bytes = bytes(body)
+    consumed = False
+    async def _receive():
+        nonlocal consumed
+        if consumed:
+            return {"type": "http.disconnect"}
+        consumed = True
+        return {"type": "http.request", "body": body_bytes, "more_body": False}
+    request._receive = _receive
     return await call_next(request)
 
 
@@ -516,9 +574,12 @@ async def root():
     return HTMLResponse(rendered)
 
 
-# Phase 5: explicit allowlist — only these two files are served from /shared/.
-# The parent-directory fallback is intentionally removed: in the Docker image
-# the shared/ directory is always at /app/shared/ (copied by the Dockerfile).
+# Explicit allowlist — only these two files are served from /shared/. Anything
+# else returns 404 before any filesystem probe, so URL-encoded path traversal
+# (../../etc/passwd, etc.) can't escape the bound. SHARED_DIR is resolved by
+# _resolve_shared_dir() above: tries ./shared/ (Docker layout) then ../shared/
+# (dev layout where apps/shared/ is a sibling), so both run modes serve the
+# same files without per-environment branching here.
 SHARED_FILES = {
     "voice-to-text.js": "application/javascript",
     "croquet-dictionary.json": "application/json",
@@ -535,7 +596,20 @@ async def shared_file(filename: str):
     file_path = SHARED_DIR / filename
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
-    return Response(content=file_path.read_text(encoding="utf-8"), media_type=content_type)
+    # CORS for public static assets: Access-Control-Allow-Origin: * so any
+    # consumer page can <script src=> these. Safe because the files are
+    # public static content and contain no per-user state. Cache for 5 min
+    # in the browser so a redeploy propagates within the user's next session
+    # without hammering the server on every page load.
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=300",
+    }
+    return Response(
+        content=file_path.read_text(encoding="utf-8"),
+        media_type=content_type,
+        headers=headers,
+    )
 
 
 @app.post("/clean")

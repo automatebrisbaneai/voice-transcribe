@@ -708,6 +708,100 @@ class TestRequestSizeMiddleware:
             f"Small body should NOT be rejected by size middleware, got {r.status_code}"
         )
 
+    def test_chunked_transfer_encoding_bypass_closed(self):
+        """No Content-Length + oversized streamed body must still 413.
+
+        Regression test for the round-2 finding: a client sending
+        Transfer-Encoding: chunked without Content-Length used to bypass the
+        middleware entirely. The slow-path stream-read now catches it.
+        """
+        import asyncio
+        import app as appmod
+
+        async def _run():
+            # Build a fake ASGI scope + receive callable that streams chunks
+            # totalling > MAX_REQUEST_BYTES, with NO Content-Length header.
+            big_chunk = b"x" * 4096
+            chunks_to_send = (appmod.MAX_REQUEST_BYTES // 4096) + 2
+            chunk_iter = iter(range(chunks_to_send))
+
+            async def receive():
+                try:
+                    next(chunk_iter)
+                    return {"type": "http.request", "body": big_chunk, "more_body": True}
+                except StopIteration:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+            sent_messages = []
+            async def send(msg):
+                sent_messages.append(msg)
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/clean",
+                "raw_path": b"/clean",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"transfer-encoding", b"chunked"),
+                    # Deliberately no content-length
+                ],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+            }
+            await appmod.app(scope, receive, send)
+            return sent_messages
+
+        messages = asyncio.run(_run())
+        # First message must be http.response.start with status 413.
+        start_msg = next((m for m in messages if m["type"] == "http.response.start"), None)
+        assert start_msg is not None, "No response start message"
+        assert start_msg["status"] == 413, (
+            f"Chunked-TE oversize body must 413, got {start_msg['status']}. "
+            f"DoS path via Transfer-Encoding: chunked is still open."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dictionary load is fault-tolerant — bad JSON does not crash app boot
+# ---------------------------------------------------------------------------
+class TestDictionaryLoad:
+    def test_dictionary_loads_real_file(self):
+        """Happy path: the live dictionary loads without error."""
+        import app as appmod
+        d = appmod._load_croquet_dictionary()
+        assert isinstance(d, dict)
+        assert "terms" in d and "players" in d
+
+    def test_dictionary_load_falls_back_on_bad_json(self, tmp_path, monkeypatch):
+        """Malformed dictionary JSON must NOT crash; returns empty dict."""
+        import app as appmod
+        bad = tmp_path / "shared"
+        bad.mkdir()
+        (bad / "croquet-dictionary.json").write_text(
+            '{"terms": ["foo"', encoding="utf-8"
+        )  # truncated — invalid JSON
+        monkeypatch.setattr(appmod, "SHARED_DIR", bad)
+        d = appmod._load_croquet_dictionary()
+        assert d == {"terms": [], "players": []}, (
+            f"Bad JSON must fall back to empty dict, got {d!r}. "
+            f"Otherwise a bad commit crash-loops the container."
+        )
+
+    def test_dictionary_load_handles_missing_file(self, tmp_path, monkeypatch):
+        """Missing dictionary file returns empty dict — no exception."""
+        import app as appmod
+        empty_dir = tmp_path / "shared"
+        empty_dir.mkdir()
+        monkeypatch.setattr(appmod, "SHARED_DIR", empty_dir)
+        d = appmod._load_croquet_dictionary()
+        assert d == {"terms": [], "players": []}
+
 
 # ---------------------------------------------------------------------------
 # Rate-limit eviction drops stale one-shot IPs
