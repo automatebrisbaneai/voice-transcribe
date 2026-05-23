@@ -111,6 +111,20 @@ OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 CLEAN_SHARED_KEY = os.environ.get("CLEAN_SHARED_KEY", "")
 CLEAN_SHARED_KEY_HEADER = "X-Talk-Key"
 
+# CORS allowlist — comma-separated origins via ALLOWED_ORIGINS env var. Adding
+# a new consumer site = update the env in Coolify + restart, no code change.
+# Default covers the three sites that consume this app today; an explicit env
+# override always wins so we don't accidentally lock new sites out on rollout.
+_DEFAULT_ORIGINS = [
+    "https://reply.croquetclaude.com",
+    "https://talk.croquetwade.com",
+    "https://table.croquetclaude.com",
+]
+_origins_env = os.environ.get("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS = [
+    o.strip() for o in _origins_env.split(",") if o.strip()
+] if _origins_env else _DEFAULT_ORIGINS
+
 # Per-IP rate limit. Default high enough that the test suite never trips it;
 # Coolify can tune via env without code changes.
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
@@ -459,11 +473,7 @@ async def request_size_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://reply.croquetclaude.com",
-        "https://talk.croquetwade.com",
-        "https://table.croquetclaude.com",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", CLEAN_SHARED_KEY_HEADER],
     allow_credentials=False,
@@ -618,11 +628,17 @@ async def shared_file(filename: str):
 
     # CORS for public static assets: Access-Control-Allow-Origin: * so any
     # consumer page can <script src=> these. Safe because the files are
-    # public static content. Cache for 5 min so a redeploy propagates within
-    # the user's next session without hammering the server.
+    # public static content.
+    #
+    # Cache-Control: no-store. The served voice-to-text.js carries the
+    # X-Talk-Key bootstrap inline; if a browser caches an OLD bootstrap
+    # after we rotate CLEAN_SHARED_KEY, every /clean POST from that tab
+    # 403s until the cache expires. no-store eliminates that stall window
+    # at the cost of one re-fetch per page load (~40KB). Trivial bandwidth,
+    # zero user-visible failure on key rotation.
     headers = {
         "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=300",
+        "Cache-Control": "no-store",
     }
     return Response(
         content=body,
