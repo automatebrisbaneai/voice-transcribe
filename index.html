@@ -132,6 +132,10 @@
         </div>
     </div>
 
+    <script>
+        // Shared-secret header injected server-side. `{}` in dev, populated in prod.
+        window.VTT_EXTRA_HEADERS = __CLEAN_SHARED_KEY_HEADERS__;
+    </script>
     <script src="/shared/voice-to-text.js"></script>
     <script>
         const vtt = VoiceToText.init({
@@ -148,8 +152,8 @@
         const clearBtn = document.getElementById('clearBtn');
 
         // Show result area whenever the textarea has content.
-        // Value changes don't fire MutationObserver events, so we use a
-        // lightweight interval plus an input listener for manual edits.
+        // Programmatic .value writes don't fire input events, so we poll.
+        // 300ms is imperceptible to users and the cost is negligible.
         function checkResult() {
             const hasContent = cleanedText.value.trim().length > 0;
             resultArea.style.display = hasContent ? 'flex' : 'none';

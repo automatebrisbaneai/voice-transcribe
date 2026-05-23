@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Default timeouts (Phase 5 — httpx per-phase timeouts)
 # connect=5s  : TCP handshake must complete quickly
-# read=30s    : normal API responses (OpenRouter JSON endpoints)
+# read=30s    : normal API responses (OpenCode JSON endpoints)
 # write=30s   : request body upload
 # pool=5s     : waiting for a free connection from the pool
 # ---------------------------------------------------------------------------
@@ -93,14 +93,63 @@ async def lifespan(application: FastAPI):
         logger.info("Application shutdown", extra={"event": "app_shutdown"})
 
 
-app = FastAPI(lifespan=lifespan)
+# docs_url/redoc_url/openapi_url all None: don't advertise the API surface
+# to anyone who guesses the conventional FastAPI paths.
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
-OPENCODE_GO_KEY = os.environ.get("OPENCODE_GO_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "deepseek-v4-flash"  # OpenCode Go bare slug (was "deepseek/deepseek-v4-flash" on OR)
+OPENCODE_GO_KEY = os.environ.get("OPENCODE_GO_KEY", "")
+MODEL = "deepseek-v4-flash"  # OpenCode Go bare slug
 OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
+
+# Shared-secret header for /clean. Empty default keeps tests + dev unauthenticated;
+# in Coolify the env var is set and every browser pulls the value via the rendered HTML.
+CLEAN_SHARED_KEY = os.environ.get("CLEAN_SHARED_KEY", "")
+CLEAN_SHARED_KEY_HEADER = "X-Talk-Key"
+
+# Per-IP rate limit. Default high enough that the test suite never trips it;
+# Coolify can tune via env without code changes.
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
+RATE_LIMIT_WINDOW_S = 60.0
 
 MIN_WORD_CHARS = 3
 MAX_CHUNK_CHARS = 2_000
+
+# ---------------------------------------------------------------------------
+# Per-IP rate limit — sliding window in process memory.
+#
+# Single-instance Coolify deployment: an in-process dict is sufficient.
+# If we ever scale horizontally, replace with Redis.
+# ---------------------------------------------------------------------------
+from collections import defaultdict, deque
+
+_rate_buckets: dict[str, deque[float]] = defaultdict(deque)
+_rate_request_count = 0  # for periodic empty-bucket purge
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True if request is under the limit, False if over.
+
+    Sliding-window over RATE_LIMIT_WINDOW_S. time.monotonic() is immune to
+    wall-clock adjustments (NTP corrections, DST) which would otherwise let
+    a buggy clock either reset or block buckets unexpectedly.
+    """
+    global _rate_request_count
+    now = time.monotonic()
+    bucket = _rate_buckets[ip]
+    cutoff = now - RATE_LIMIT_WINDOW_S
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_PER_MIN:
+        return False
+    bucket.append(now)
+    # Periodic prune of fully-emptied buckets so the dict doesn't grow without bound.
+    _rate_request_count += 1
+    if _rate_request_count % 500 == 0:
+        empty_keys = [k for k, b in _rate_buckets.items() if not b]
+        for k in empty_keys:
+            del _rate_buckets[k]
+    return True
+
 
 _META_START_RE = re.compile(
     r"^\s*(sure|certainly|okay|of course|please|here is|here's|understood|"
@@ -368,10 +417,31 @@ async def healthz():
     return {"status": "ok"}
 
 
+_INDEX_PATH = Path(__file__).parent / "index.html"
+_INDEX_PLACEHOLDER = "__CLEAN_SHARED_KEY_HEADERS__"
+
+
 @app.get("/")
 async def root():
-    html_path = Path(__file__).parent / "index.html"
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    """Serve index.html with the shared-secret headers rendered as a JS object literal.
+
+    The placeholder in index.html sits where a JSON object literal goes:
+        window.VTT_EXTRA_HEADERS = __CLEAN_SHARED_KEY_HEADERS__;
+    We substitute with `{"X-Talk-Key": "<key>"}` when the secret is set, or `{}`
+    when unset (dev mode — voice-to-text.js sends no extra header).
+
+    Read on every request because Coolify hot-replaces the file on deploy and
+    keeps the same process running between releases. File is tiny so the extra
+    disk hit is irrelevant.
+    """
+    html = _INDEX_PATH.read_text(encoding="utf-8")
+    headers_obj = (
+        json.dumps({CLEAN_SHARED_KEY_HEADER: CLEAN_SHARED_KEY})
+        if CLEAN_SHARED_KEY
+        else "{}"
+    )
+    rendered = html.replace(_INDEX_PLACEHOLDER, headers_obj)
+    return HTMLResponse(rendered)
 
 
 # Phase 5: explicit allowlist — only these two files are served from /shared/.
@@ -405,6 +475,26 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
         or (request.client.host if request.client else "unknown")
     )
     t_start = time.monotonic()
+
+    # Shared-secret gate — only active when CLEAN_SHARED_KEY env is set.
+    # Generic 403 (no key name in the response body) so probing tools learn nothing.
+    if CLEAN_SHARED_KEY and request.headers.get(CLEAN_SHARED_KEY_HEADER) != CLEAN_SHARED_KEY:
+        logger.warning(
+            "Forbidden clean attempt (missing/invalid auth header)",
+            extra={"event": "clean_forbidden", "client_ip": client_ip},
+        )
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Per-IP rate limit — drops drive-by abuse before we hit the LLM. Trusted
+    # browsers carrying the shared secret are still subject to the same limit
+    # so a compromised key cannot rinse the budget from a single host.
+    if not _check_rate_limit(client_ip):
+        logger.warning(
+            "Rate limit exceeded",
+            extra={"event": "clean_rate_limited", "client_ip": client_ip},
+        )
+        raise HTTPException(status_code=429, detail="Too many requests")
+
     raw = req.text or ""
 
     # Phase 5: normalize input — NFKC, strip zero-width chars, strip control chars.
@@ -457,9 +547,9 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
 
         if "choices" not in data:
             logger.error(
-                "OpenRouter returned error response",
+                "Upstream LLM returned error response",
                 extra={
-                    "event": "openrouter_clean",
+                    "event": "upstream_clean",
                     "status_code": res.status_code,
                     "duration_ms": or_duration_ms,
                     "input_chars": input_chars,
@@ -470,11 +560,11 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
             )
             duration_ms = round((time.monotonic() - t_start) * 1000)
             logger.warning(
-                "Clean failed — openrouter_error",
+                "Clean failed — upstream_error",
                 extra={
                     "event": "clean_failure",
                     "duration_ms": duration_ms,
-                    "failure_reason": "openrouter_error",
+                    "failure_reason": "upstream_error",
                 },
             )
             raise HTTPException(status_code=502, detail="Transcript cleaning failed, please try again.")
@@ -484,9 +574,9 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
         or_duration_ms = round((time.monotonic() - t_or_start) * 1000)
 
         logger.info(
-            "OpenRouter clean succeeded",
+            "Upstream clean succeeded",
             extra={
-                "event": "openrouter_clean",
+                "event": "upstream_clean",
                 "status_code": res.status_code,
                 "duration_ms": or_duration_ms,
                 "input_chars": input_chars,
