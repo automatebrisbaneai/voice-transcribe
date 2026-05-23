@@ -548,30 +548,14 @@ async def healthz():
 
 
 _INDEX_PATH = Path(__file__).parent / "index.html"
-_INDEX_PLACEHOLDER = "__CLEAN_SHARED_KEY_HEADERS__"
 
 
 @app.get("/")
 async def root():
-    """Serve index.html with the shared-secret headers rendered as a JS object literal.
-
-    The placeholder in index.html sits where a JSON object literal goes:
-        window.VTT_EXTRA_HEADERS = __CLEAN_SHARED_KEY_HEADERS__;
-    We substitute with `{"X-Talk-Key": "<key>"}` when the secret is set, or `{}`
-    when unset (dev mode — voice-to-text.js sends no extra header).
-
-    Read on every request because Coolify hot-replaces the file on deploy and
-    keeps the same process running between releases. File is tiny so the extra
-    disk hit is irrelevant.
+    """Serve index.html as-is. Auth-gate bootstrap now lives inside the served
+    voice-to-text.js (see shared_file), so the HTML needs no per-request rendering.
     """
-    html = _INDEX_PATH.read_text(encoding="utf-8")
-    headers_obj = (
-        json.dumps({CLEAN_SHARED_KEY_HEADER: CLEAN_SHARED_KEY})
-        if CLEAN_SHARED_KEY
-        else "{}"
-    )
-    rendered = html.replace(_INDEX_PLACEHOLDER, headers_obj)
-    return HTMLResponse(rendered)
+    return HTMLResponse(_INDEX_PATH.read_text(encoding="utf-8"))
 
 
 # Explicit allowlist — only these two files are served from /shared/. Anything
@@ -596,17 +580,40 @@ async def shared_file(filename: str):
     file_path = SHARED_DIR / filename
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
+
+    body = file_path.read_text(encoding="utf-8")
+
+    # SECURITY/UX: when serving voice-to-text.js, prepend a tiny bootstrap line
+    # that sets window.VTT_EXTRA_HEADERS from the server-side CLEAN_SHARED_KEY.
+    # Three wins:
+    #   1. Auth gate flips via Coolify env alone — no consumer-page redeploys.
+    #   2. Every consumer page (cross-domain or same-origin) gets the same
+    #      secret automatically — no per-app rendering, no drift.
+    #   3. If CLEAN_SHARED_KEY is unset, an empty headers object is rendered
+    #      and the lib's whitelist filter is a no-op (dev mode).
+    # The secret IS readable by anyone who view-sources the JS — that's the
+    # accepted trade-off documented in the round-1 review. It still stops
+    # drive-by curl/scripted abuse, which is the entire goal.
+    if filename == "voice-to-text.js":
+        bootstrap = (
+            "window.VTT_EXTRA_HEADERS="
+            + json.dumps(
+                {CLEAN_SHARED_KEY_HEADER: CLEAN_SHARED_KEY} if CLEAN_SHARED_KEY else {}
+            )
+            + ";\n"
+        )
+        body = bootstrap + body
+
     # CORS for public static assets: Access-Control-Allow-Origin: * so any
     # consumer page can <script src=> these. Safe because the files are
-    # public static content and contain no per-user state. Cache for 5 min
-    # in the browser so a redeploy propagates within the user's next session
-    # without hammering the server on every page load.
+    # public static content. Cache for 5 min so a redeploy propagates within
+    # the user's next session without hammering the server.
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "public, max-age=300",
     }
     return Response(
-        content=file_path.read_text(encoding="utf-8"),
+        content=body,
         media_type=content_type,
         headers=headers,
     )

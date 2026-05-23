@@ -132,10 +132,8 @@
         </div>
     </div>
 
-    <script>
-        // Shared-secret header injected server-side. `{}` in dev, populated in prod.
-        window.VTT_EXTRA_HEADERS = __CLEAN_SHARED_KEY_HEADERS__;
-    </script>
+    <!-- voice-to-text.js bootstraps window.VTT_EXTRA_HEADERS itself when served
+         from talk.croquetwade.com — see /shared/{filename} in app.py. -->
     <script src="/shared/voice-to-text.js"></script>
     <script>
         const vtt = VoiceToText.init({

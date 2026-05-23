@@ -583,43 +583,61 @@ class TestRateLimit:
 
 
 # ---------------------------------------------------------------------------
-# Index page renders the shared-key headers placeholder
+# Served voice-to-text.js auto-bootstraps window.VTT_EXTRA_HEADERS
 # ---------------------------------------------------------------------------
-class TestIndexRender:
-    def test_index_substitutes_placeholder_dev_mode(self, client):
-        """Empty CLEAN_SHARED_KEY → placeholder substituted with `{}`."""
+class TestVoiceLibBootstrap:
+    def test_voice_lib_bootstrap_empty_when_key_unset(self, client):
+        """No CLEAN_SHARED_KEY → bootstrap renders {}; lib whitelist is a no-op."""
         import app as appmod
         original = appmod.CLEAN_SHARED_KEY
         appmod.CLEAN_SHARED_KEY = ""
         try:
-            r = client.get("/")
+            r = client.get("/shared/voice-to-text.js")
             assert r.status_code == 200
             body = r.text
-            assert "__CLEAN_SHARED_KEY_HEADERS__" not in body, (
-                "Placeholder must always be substituted, even when key is empty."
+            assert body.startswith("window.VTT_EXTRA_HEADERS={};"), (
+                f"Expected dev-mode bootstrap line at top of served JS, "
+                f"got {body[:120]!r}"
             )
-            assert "window.VTT_EXTRA_HEADERS = {};" in body, (
-                "Dev mode should render an empty headers object."
+            # The actual lib source must still follow the bootstrap.
+            assert "VoiceToText" in body
+        finally:
+            appmod.CLEAN_SHARED_KEY = original
+
+    def test_voice_lib_bootstrap_renders_secret(self, client):
+        """CLEAN_SHARED_KEY set → bootstrap renders {"X-Talk-Key": "<key>"}."""
+        import app as appmod
+        original = appmod.CLEAN_SHARED_KEY
+        appmod.CLEAN_SHARED_KEY = "bootstrap-secret-xyz"
+        try:
+            r = client.get("/shared/voice-to-text.js")
+            assert r.status_code == 200
+            body = r.text
+            assert body.startswith(
+                'window.VTT_EXTRA_HEADERS={"X-Talk-Key": "bootstrap-secret-xyz"};'
+            ), (
+                f"Expected bootstrap with secret at top of served JS, "
+                f"got {body[:160]!r}"
             )
         finally:
             appmod.CLEAN_SHARED_KEY = original
 
-    def test_index_substitutes_placeholder_with_key(self, client):
-        """Set CLEAN_SHARED_KEY → placeholder substituted with `{"X-Talk-Key": "..."}`.
-        The actual secret value must appear in the rendered HTML so the browser
-        can read it; this is the documented trade-off (speed bump, not real auth)."""
+    def test_dictionary_bootstrap_not_injected(self, client):
+        """Only voice-to-text.js gets the bootstrap prefix — the dictionary JSON
+        is served raw so JSON.parse doesn't choke on prepended JS."""
         import app as appmod
         original = appmod.CLEAN_SHARED_KEY
-        appmod.CLEAN_SHARED_KEY = "render-test-xyz"
+        appmod.CLEAN_SHARED_KEY = "secret"
         try:
-            r = client.get("/")
+            r = client.get("/shared/croquet-dictionary.json")
             assert r.status_code == 200
-            body = r.text
-            assert "__CLEAN_SHARED_KEY_HEADERS__" not in body
-            assert '"X-Talk-Key": "render-test-xyz"' in body, (
-                f"Expected rendered headers object in body, but it was missing. "
-                f"Snippet: {body[body.find('VTT_EXTRA_HEADERS'):body.find('VTT_EXTRA_HEADERS')+120]}"
+            assert not r.text.startswith("window."), (
+                f"Dictionary must NOT be prefixed with JS bootstrap, "
+                f"got {r.text[:60]!r}"
             )
+            # Must still parse as valid JSON.
+            import json as _json
+            _json.loads(r.text)
         finally:
             appmod.CLEAN_SHARED_KEY = original
 
