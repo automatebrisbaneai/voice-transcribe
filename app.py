@@ -95,8 +95,9 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "deepseek/deepseek-v4-flash"
+OPENCODE_GO_KEY = os.environ.get("OPENCODE_GO_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
+MODEL = "deepseek-v4-flash"  # OpenCode Go bare slug (was "deepseek/deepseek-v4-flash" on OR)
+OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 
 MIN_WORD_CHARS = 3
 MAX_CHUNK_CHARS = 2_000
@@ -431,10 +432,11 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
     try:
         t_or_start = time.monotonic()
         res = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            OPENCODE_GO_URL,
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {OPENCODE_GO_KEY}",
                 "Content-Type": "application/json",
+                "User-Agent": "croquetwade-worker/1.0",
             },
             json={
                 "model": MODEL,
@@ -442,7 +444,11 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": normalized},
                 ],
-                "max_tokens": min(2048, max(256, int(len(raw) * 1.5))),
+                # Floor raised from 256 -> 500: DeepSeek V4 on OpenCode Go burns
+                # ~100 hidden reasoning tokens that OR's reasoning={"effort":"none"}
+                # extension does not suppress here. Leaves headroom for the actual
+                # cleaned content after reasoning is paid out.
+                "max_tokens": min(2048, max(500, int(len(raw) * 1.5))),
             },
         )
         or_duration_ms = round((time.monotonic() - t_or_start) * 1000)
