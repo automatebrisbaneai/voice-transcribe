@@ -444,11 +444,12 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": normalized},
                 ],
-                # Floor raised from 256 -> 500: DeepSeek V4 on OpenCode Go burns
-                # ~100 hidden reasoning tokens that OR's reasoning={"effort":"none"}
-                # extension does not suppress here. Leaves headroom for the actual
-                # cleaned content after reasoning is paid out.
-                "max_tokens": min(2048, max(500, int(len(raw) * 1.5))),
+                # DeepSeek V4 on OpenCode burns substantial hidden reasoning tokens
+                # against max_tokens (OR's reasoning={"effort":"none"} extension is
+                # silently ignored). 500-token floor was too tight — reasoning ate
+                # every token, content came back empty. 4096 covers reasoning + actual
+                # cleaned output even for the longest practical transcripts.
+                "max_tokens": 4096,
             },
         )
         or_duration_ms = round((time.monotonic() - t_or_start) * 1000)
