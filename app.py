@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -138,6 +140,15 @@ MAX_CHUNK_CHARS = 2_000
 # the JSON envelope adds a small fixed overhead, so 8KB gives headroom without
 # letting an attacker stream a 50MB body just to land in a 413 reply.
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "8192"))
+
+# Outline @croquetclaude mention receiver
+OUTLINE_WEBHOOK_SECRET = os.environ.get("OUTLINE_WEBHOOK_SECRET", "")
+OUTLINE_API_TOKEN = os.environ.get("OUTLINE_API_TOKEN", "")
+OUTLINE_API_BASE = os.environ.get("OUTLINE_API_BASE", "https://docs.croquetwade.com/api")
+_OUTLINE_OR_KEY = (
+    os.environ.get("OPENROUTER_KEY")
+    or os.environ.get("OPENROUTER_API_KEY", "")
+)
 
 # ---------------------------------------------------------------------------
 # Per-IP rate limit — sliding window in process memory.
@@ -395,6 +406,10 @@ async def correlation_id_middleware(request: Request, call_next):
 @app.middleware("http")
 async def request_size_middleware(request: Request, call_next):
     from fastapi.responses import Response as _Response
+
+    # Outline webhook payloads may legitimately exceed the /clean 8 KB cap.
+    if request.url.path == "/outline/webhook":
+        return await call_next(request)
 
     def _too_large_response(reason: str) -> _Response:
         logger.warning(
@@ -806,3 +821,254 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
             },
         )
         raise HTTPException(status_code=502, detail="Transcript cleaning failed, please try again.")
+
+
+# ---------------------------------------------------------------------------
+# Outline @croquetclaude mention receiver
+#
+# Outline fires a webhook for every comments.create and documents.update event.
+# This route extracts ProseMirror mention nodes (not Markdown, which omits them),
+# checks for @croquetclaude, and replies as CroquetClaude via the Outline API.
+#
+# Required Coolify env vars on this service:
+#   OUTLINE_API_TOKEN       — CroquetClaude's member token
+#   OPENROUTER_KEY          — OpenRouter key for the answer LLM
+#   OUTLINE_WEBHOOK_SECRET  — Outline webhook signing secret (set in Outline → Integrations → Webhooks)
+# ---------------------------------------------------------------------------
+
+_MENTION_RE_OL = re.compile(r"(?<!\w)@croquetclaude\b", re.I)
+_webhook_seen: set[str] = set()  # in-process dedup — catches webhook retries within a session
+
+_OR_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OR_SMART_MODEL = "deepseek/deepseek-v4-pro"
+
+_MENTION_SYSTEM = (
+    "You are CroquetClaude, the AI assistant to the Croquet Association of Queensland "
+    "(CAQ) committee. You live inside the committee's private Outline workspace and reply "
+    "when a member mentions you (@croquetclaude) in a comment or document.\n"
+    "Answer in plain, warm Australian English (Australian spelling; no em dashes). Be "
+    "concise and genuinely useful — a few sentences, not an essay. Ground your answer in "
+    "the document context; if the answer is not there, say so plainly rather than guessing."
+)
+
+
+def _pm_node_to_text(node) -> str:
+    """Recursively extract plain text from a ProseMirror node.
+
+    Native Outline @mention creates a structured node (type=mention, attrs.label=Name).
+    These are invisible in the Markdown text export — the ProseMirror data field is required.
+    """
+    if not isinstance(node, dict):
+        return ""
+    out = []
+    for child in (node.get("content") or []):
+        t = child.get("type")
+        if t == "text":
+            out.append(child.get("text", ""))
+        elif t == "mention":
+            label = (child.get("attrs") or {}).get("label", "")
+            if label:
+                out.append(f"@{label}")
+        elif child.get("content"):
+            sub = _pm_node_to_text(child)
+            if sub.strip():
+                out.append(sub)
+            out.append("\n")
+    return "".join(out)
+
+
+async def _outline_api(client: httpx.AsyncClient, action: str, payload: dict) -> dict:
+    r = await client.post(
+        f"{OUTLINE_API_BASE}/{action}",
+        headers={
+            "Authorization": f"Bearer {OUTLINE_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0),
+    )
+    return r.json()
+
+
+async def _generate_mention_reply(
+    client: httpx.AsyncClient,
+    doc_title: str, doc_body: str, thread: str, mention: str,
+) -> str:
+    if not _OUTLINE_OR_KEY:
+        return ""
+    r = await client.post(
+        _OR_CHAT_URL,
+        headers={
+            "Authorization": f"Bearer {_OUTLINE_OR_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://croquetclaude.com",
+        },
+        json={
+            "model": _OR_SMART_MODEL,
+            "reasoning": {"effort": "none"},
+            "messages": [
+                {"role": "system", "content": _MENTION_SYSTEM},
+                {"role": "user", "content": (
+                    f"Document: {doc_title}\n\n"
+                    f"Content:\n{doc_body[:5000] or '(empty)'}\n\n"
+                    f"Thread:\n{thread or '(first comment)'}\n\n"
+                    f"They wrote:\n{mention}\n\nWrite your reply."
+                )},
+            ],
+            "temperature": 0.4,
+            "max_tokens": 800,
+        },
+        timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+    )
+    data = r.json()
+    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
+
+
+async def _reply_to_comment_mention(
+    client: httpx.AsyncClient,
+    doc_id: str, comment_id: str, parent_id: str, mention_text: str, asker: str,
+) -> None:
+    doc_resp = await _outline_api(client, "documents.info", {"id": doc_id})
+    doc = doc_resp.get("data") or {}
+
+    comments_resp = await _outline_api(client, "comments.list", {"documentId": doc_id, "limit": 50})
+    comments = comments_resp.get("data") or []
+
+    # Idempotency: skip if we already replied to this comment
+    me_resp = await _outline_api(client, "auth.info", {})
+    my_id = (((me_resp.get("data") or {}).get("user")) or {}).get("id", "")
+    if my_id and any(
+        c.get("parentCommentId") == comment_id
+        and (c.get("createdBy") or {}).get("id") == my_id
+        for c in comments
+    ):
+        return
+
+    thread = "\n".join(
+        f"{(c.get('createdBy') or {}).get('name', '?')}: {_pm_node_to_text(c.get('data') or {})}"
+        for c in sorted(comments, key=lambda c: c.get("createdAt", ""))
+    )
+    reply = await _generate_mention_reply(
+        client, doc.get("title", "(untitled)"), doc.get("text", ""), thread, mention_text,
+    )
+    if reply:
+        await _outline_api(client, "comments.create", {
+            "documentId": doc_id,
+            "parentCommentId": parent_id,
+            "text": reply,
+        })
+        logger.info(
+            "Outline comment mention answered",
+            extra={"event": "outline_mention_answered", "comment_id": comment_id, "asker": asker},
+        )
+
+
+async def _reply_to_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
+    doc_resp = await _outline_api(client, "documents.info", {"id": doc_id})
+    doc = doc_resp.get("data") or {}
+
+    # documents.info returns the ProseMirror data field — captures native @mention nodes
+    # that the Markdown text field omits.
+    body_text = _pm_node_to_text(doc.get("data") or {})
+    if not _MENTION_RE_OL.search(body_text):
+        return
+
+    lines = [ln.strip() for ln in body_text.splitlines() if ln.strip() and _MENTION_RE_OL.search(ln)]
+    if not lines:
+        return
+
+    mention_key = f"body:{doc_id}:{hashlib.sha1(lines[0].encode()).hexdigest()[:16]}"
+    if mention_key in _webhook_seen:
+        return
+
+    comments_resp = await _outline_api(client, "comments.list", {"documentId": doc_id, "limit": 50})
+    comments = comments_resp.get("data") or []
+    me_resp = await _outline_api(client, "auth.info", {})
+    my_id = (((me_resp.get("data") or {}).get("user")) or {}).get("id", "")
+
+    # Idempotency: skip if we already left a comment quoting this mention line
+    if my_id and any(
+        lines[0] in _pm_node_to_text(c.get("data") or {})
+        and (c.get("createdBy") or {}).get("id") == my_id
+        for c in comments
+    ):
+        _webhook_seen.add(mention_key)
+        return
+
+    _webhook_seen.add(mention_key)
+    thread = "\n".join(
+        f"{(c.get('createdBy') or {}).get('name', '?')}: {_pm_node_to_text(c.get('data') or {})}"
+        for c in sorted(comments, key=lambda c: c.get("createdAt", ""))
+    )
+    reply = await _generate_mention_reply(
+        client, doc.get("title", "(untitled)"), doc.get("text", ""), thread, lines[0],
+    )
+    if reply:
+        await _outline_api(client, "comments.create", {
+            "documentId": doc_id,
+            "text": f"> {lines[0]}\n\n{reply}",
+        })
+        logger.info(
+            "Outline doc mention answered",
+            extra={"event": "outline_doc_mention_answered", "doc_id": doc_id},
+        )
+
+
+@app.post("/outline/webhook")
+async def outline_webhook(request: Request):
+    """Receive Outline webhook events, detect @croquetclaude mentions, reply as CroquetClaude."""
+    body = await request.body()
+
+    # HMAC signature verification — skip if OUTLINE_WEBHOOK_SECRET is not configured.
+    if OUTLINE_WEBHOOK_SECRET:
+        sig = request.headers.get("x-outline-signature", "")
+        expected = "sha256=" + hmac.new(
+            OUTLINE_WEBHOOK_SECRET.encode(), body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            logger.warning(
+                "Outline webhook bad signature",
+                extra={"event": "outline_webhook_bad_sig"},
+            )
+            raise HTTPException(status_code=401, detail="Bad signature")
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Bad JSON")
+
+    event = payload.get("event", "")
+    data = payload.get("data") or {}
+    client: httpx.AsyncClient = request.app.state.http
+
+    if event == "comments.create":
+        comment_id = data.get("id", "")
+        if not comment_id or comment_id in _webhook_seen:
+            return {"ok": True}
+        text = _pm_node_to_text(data.get("data") or {})
+        if _MENTION_RE_OL.search(text):
+            _webhook_seen.add(comment_id)
+            doc_id = data.get("documentId", "")
+            parent_id = data.get("parentCommentId") or comment_id
+            asker = (data.get("createdBy") or {}).get("name", "a committee member")
+            try:
+                await _reply_to_comment_mention(client, doc_id, comment_id, parent_id, text, asker)
+            except Exception as exc:
+                logger.error(
+                    "Outline comment webhook error",
+                    extra={"event": "outline_webhook_error", "exc": str(exc)},
+                )
+                _webhook_seen.discard(comment_id)
+
+    elif event == "documents.update":
+        doc_id = data.get("id", "")
+        if doc_id:
+            try:
+                await _reply_to_doc_mention(client, doc_id)
+            except Exception as exc:
+                logger.error(
+                    "Outline doc webhook error",
+                    extra={"event": "outline_webhook_error", "exc": str(exc)},
+                )
+
+    return {"ok": True}
