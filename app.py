@@ -408,7 +408,7 @@ async def request_size_middleware(request: Request, call_next):
     from fastapi.responses import Response as _Response
 
     # Outline webhook payloads may legitimately exceed the /clean 8 KB cap.
-    if request.url.path == "/outline/webhook":
+    if request.url.path in ("/outline/webhook", "/outline/webhook/"):
         return await call_next(request)
 
     def _too_large_response(reason: str) -> _Response:
@@ -1015,6 +1015,7 @@ async def _reply_to_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
 
 
 @app.post("/outline/webhook")
+@app.post("/outline/webhook/")
 async def outline_webhook(request: Request):
     """Receive Outline webhook events, detect @croquetclaude mentions, reply as CroquetClaude."""
     body = await request.body()
