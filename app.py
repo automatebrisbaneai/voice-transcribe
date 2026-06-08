@@ -1068,11 +1068,18 @@ async def outline_webhook(request: Request):
     data = payload.get("data") or {}
     client: httpx.AsyncClient = request.app.state.http
 
+    logger.info("Outline webhook received",
+                extra={"event": "outline_webhook_recv", "ol_event": event,
+                       "data_keys": sorted(data.keys())[:15]})
+
     if event == "comments.create":
         comment_id = data.get("id", "")
         if not comment_id or comment_id in _webhook_seen:
             return {"ok": True}
         text = _pm_node_to_text(data.get("data") or {})
+        logger.info("Outline comment event",
+                    extra={"event": "outline_comment_recv", "comment_id": comment_id,
+                           "text_preview": text[:80], "matched": bool(_MENTION_RE_OL.search(text))})
         if _MENTION_RE_OL.search(text):
             _webhook_seen.add(comment_id)
             try:
