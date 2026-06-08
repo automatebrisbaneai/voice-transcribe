@@ -1070,7 +1070,8 @@ async def outline_webhook(request: Request):
 
     logger.info("Outline webhook received",
                 extra={"event": "outline_webhook_recv", "ol_event": event,
-                       "data_keys": sorted(data.keys())[:15]})
+                       "top_keys": sorted(payload.keys()),
+                       "raw": json.dumps(payload)[:700]})
 
     if event == "comments.create":
         comment_id = data.get("id", "")
