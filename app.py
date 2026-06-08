@@ -978,10 +978,14 @@ async def _handle_comment_mention(client: httpx.AsyncClient, data: dict) -> None
     await _ack_and_patch(client, res, doc_id, parent_id)
 
 
-async def _handle_doc_mention(client: httpx.AsyncClient, doc: dict) -> None:
-    """Enqueue a document-body @mention. The documents.update payload IS the doc object
-    (id, title, url, ProseMirror data)."""
-    doc_id = doc.get("id", "")
+async def _handle_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
+    """Enqueue a document-body @mention. Fetch documents.info for the ProseMirror `data`
+    (the webhook's documents.update model isn't guaranteed to carry it; native @mention
+    nodes are not in the Markdown text export)."""
+    if not doc_id:
+        return
+    resp = await _outline_api(client, "documents.info", {"id": doc_id})
+    doc = resp.get("data") or {}
     body_text = _pm_node_to_text(doc.get("data") or {})
     if not _MENTION_RE_OL.search(body_text):
         return
@@ -1065,26 +1069,19 @@ async def outline_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Bad JSON")
 
     event = payload.get("event", "")
-    data = payload.get("data") or {}
+    # Outline wraps the entity as payload.payload.model (NOT payload.data).
+    model = (payload.get("payload") or {}).get("model") or {}
     client: httpx.AsyncClient = request.app.state.http
 
-    logger.info("Outline webhook received",
-                extra={"event": "outline_webhook_recv", "ol_event": event,
-                       "top_keys": sorted(payload.keys()),
-                       "raw": json.dumps(payload)[:700]})
-
     if event == "comments.create":
-        comment_id = data.get("id", "")
+        comment_id = model.get("id", "")
         if not comment_id or comment_id in _webhook_seen:
             return {"ok": True}
-        text = _pm_node_to_text(data.get("data") or {})
-        logger.info("Outline comment event",
-                    extra={"event": "outline_comment_recv", "comment_id": comment_id,
-                           "text_preview": text[:80], "matched": bool(_MENTION_RE_OL.search(text))})
+        text = _pm_node_to_text(model.get("data") or {})
         if _MENTION_RE_OL.search(text):
             _webhook_seen.add(comment_id)
             try:
-                await _handle_comment_mention(client, data)
+                await _handle_comment_mention(client, model)
             except Exception as exc:
                 # Enqueue failed (e.g. util PB unreachable). By design we post NO ack we
                 # can't fulfil; drop the in-process flag so an Outline retry can succeed.
@@ -1095,10 +1092,10 @@ async def outline_webhook(request: Request):
                 _webhook_seen.discard(comment_id)
 
     elif event == "documents.update":
-        doc = data  # the documents.update payload is the doc object
-        if doc.get("id"):
+        doc_id = model.get("id", "")
+        if doc_id:
             try:
-                await _handle_doc_mention(client, doc)
+                await _handle_doc_mention(client, doc_id)
             except Exception as exc:
                 logger.error(
                     "Outline doc webhook error",
