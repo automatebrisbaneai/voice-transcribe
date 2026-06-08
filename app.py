@@ -1012,6 +1012,33 @@ async def _handle_doc_mention(client: httpx.AsyncClient, doc: dict) -> None:
     await _ack_and_patch(client, res, doc_id, parent_id="")  # top-level ack for body mentions
 
 
+def _verify_outline_sig(body: bytes, headers) -> bool:
+    """Verify an Outline webhook signature.
+
+    Outline signs Stripe-style: header `Outline-Signature: t=<ts>,s=<hmac>` where
+    hmac = HMAC-SHA256(secret, "<ts>.<raw-body>"). We also accept the legacy
+    `X-Outline-Signature: sha256=<hmac(body)>` scheme as a fallback, and try a
+    body-only variant, so a minor format difference can't lock us out.
+    """
+    secret = OUTLINE_WEBHOOK_SECRET.encode()
+    ol = headers.get("outline-signature", "")
+    if ol and "s=" in ol:
+        parts = {}
+        for kv in ol.split(","):
+            k, _, v = kv.partition("=")
+            parts[k.strip()] = v.strip()
+        t, s = parts.get("t", ""), parts.get("s", "")
+        if s:
+            for msg in (t.encode() + b"." + body, body):
+                if hmac.compare_digest(s, hmac.new(secret, msg, hashlib.sha256).hexdigest()):
+                    return True
+    x = headers.get("x-outline-signature", "")
+    if x:
+        if hmac.compare_digest(x, "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()):
+            return True
+    return False
+
+
 @app.post("/outline/webhook")
 @app.post("/outline/webhook/")
 async def outline_webhook(request: Request):
@@ -1020,14 +1047,15 @@ async def outline_webhook(request: Request):
 
     # HMAC signature verification — skip if OUTLINE_WEBHOOK_SECRET is not configured.
     if OUTLINE_WEBHOOK_SECRET:
-        sig = request.headers.get("x-outline-signature", "")
-        expected = "sha256=" + hmac.new(
-            OUTLINE_WEBHOOK_SECRET.encode(), body, hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(sig, expected):
+        if not _verify_outline_sig(body, request.headers):
+            ol = request.headers.get("outline-signature", "")
+            xol = request.headers.get("x-outline-signature", "")
             logger.warning(
                 "Outline webhook bad signature",
-                extra={"event": "outline_webhook_bad_sig"},
+                extra={"event": "outline_webhook_bad_sig",
+                       "stripe_style": bool(ol and "s=" in ol),
+                       "legacy_style": bool(xol),
+                       "sig_preview": (ol or xol)[:28]},
             )
             raise HTTPException(status_code=401, detail="Bad signature")
 
