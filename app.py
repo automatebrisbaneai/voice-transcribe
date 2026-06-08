@@ -141,14 +141,19 @@ MAX_CHUNK_CHARS = 2_000
 # letting an attacker stream a 50MB body just to land in a 413 reply.
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "8192"))
 
-# Outline @croquetclaude mention receiver
+# Outline @croquetclaude mention receiver.
+# The mention is NOT answered here. We enqueue it to util PB and post an instant
+# "working on it" ack; the local outline-mention-watcher (on Wade's machine, where
+# Hermes + QMD live) does the answering and CC escalation. See
+# system/memory/reference_outline_mention_answering.md.
 OUTLINE_WEBHOOK_SECRET = os.environ.get("OUTLINE_WEBHOOK_SECRET", "")
 OUTLINE_API_TOKEN = os.environ.get("OUTLINE_API_TOKEN", "")
-OUTLINE_API_BASE = os.environ.get("OUTLINE_API_BASE", "https://docs.croquetwade.com/api")
-_OUTLINE_OR_KEY = (
-    os.environ.get("OPENROUTER_KEY")
-    or os.environ.get("OPENROUTER_API_KEY", "")
-)
+OUTLINE_API_BASE = os.environ.get("OUTLINE_API_BASE", "https://docs.croquetclaude.com/api")
+
+# util PocketBase queue (reachable from Sydney + Wade's machine)
+UTIL_PB_URL = os.environ.get("UTIL_PB_URL", "https://util.croquetwade.com")
+UTIL_PB_EMAIL = os.environ.get("UTIL_PB_EMAIL", "")
+UTIL_PB_PASSWORD = os.environ.get("UTIL_PB_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
 # Per-IP rate limit — sliding window in process memory.
@@ -837,18 +842,12 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
 # ---------------------------------------------------------------------------
 
 _MENTION_RE_OL = re.compile(r"(?<!\w)@croquetclaude\b", re.I)
-_webhook_seen: set[str] = set()  # in-process dedup — catches webhook retries within a session
+_webhook_seen: set[str] = set()  # in-process fast dedup; the durable dedup is the util PB unique comment_id
 
-_OR_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-_OR_SMART_MODEL = "deepseek/deepseek-v4-pro"
-
-_MENTION_SYSTEM = (
-    "You are CroquetClaude, the AI assistant to the Croquet Association of Queensland "
-    "(CAQ) committee. You live inside the committee's private Outline workspace and reply "
-    "when a member mentions you (@croquetclaude) in a comment or document.\n"
-    "Answer in plain, warm Australian English (Australian spelling; no em dashes). Be "
-    "concise and genuinely useful — a few sentences, not an essay. Ground your answer in "
-    "the document context; if the answer is not there, say so plainly rather than guessing."
+# Canned instant acknowledgement (no LLM). CroquetClaude voice, AU English, no em-dashes.
+_ACK_TEXT = (
+    "G'day, CroquetClaude here. I've got your question and I'm looking into it now. "
+    "I'll pop the answer right here shortly."
 )
 
 
@@ -890,128 +889,127 @@ async def _outline_api(client: httpx.AsyncClient, action: str, payload: dict) ->
     return r.json()
 
 
-async def _generate_mention_reply(
-    client: httpx.AsyncClient,
-    doc_title: str, doc_body: str, thread: str, mention: str,
-) -> str:
-    if not _OUTLINE_OR_KEY:
-        return ""
+# --- util PB queue helpers (the mention is answered by the local worker, not here) ---
+
+_utilpb = {"token": None, "exp": 0.0}
+
+
+async def _utilpb_token(client: httpx.AsyncClient) -> str:
+    now = time.time()
+    if _utilpb["token"] and now < _utilpb["exp"]:
+        return _utilpb["token"]
     r = await client.post(
-        _OR_CHAT_URL,
-        headers={
-            "Authorization": f"Bearer {_OUTLINE_OR_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://croquetclaude.com",
-        },
-        json={
-            "model": _OR_SMART_MODEL,
-            "reasoning": {"effort": "none"},
-            "messages": [
-                {"role": "system", "content": _MENTION_SYSTEM},
-                {"role": "user", "content": (
-                    f"Document: {doc_title}\n\n"
-                    f"Content:\n{doc_body[:5000] or '(empty)'}\n\n"
-                    f"Thread:\n{thread or '(first comment)'}\n\n"
-                    f"They wrote:\n{mention}\n\nWrite your reply."
-                )},
-            ],
-            "temperature": 0.4,
-            "max_tokens": 800,
-        },
-        timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+        f"{UTIL_PB_URL}/api/collections/_superusers/auth-with-password",
+        json={"identity": UTIL_PB_EMAIL, "password": UTIL_PB_PASSWORD},
+        timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
     )
-    data = r.json()
-    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
+    r.raise_for_status()
+    tok = r.json()["token"]
+    _utilpb["token"] = tok
+    _utilpb["exp"] = now + 25 * 60
+    return tok
 
 
-async def _reply_to_comment_mention(
-    client: httpx.AsyncClient,
-    doc_id: str, comment_id: str, parent_id: str, mention_text: str, asker: str,
-) -> None:
-    doc_resp = await _outline_api(client, "documents.info", {"id": doc_id})
-    doc = doc_resp.get("data") or {}
-
-    comments_resp = await _outline_api(client, "comments.list", {"documentId": doc_id, "limit": 50})
-    comments = comments_resp.get("data") or []
-
-    # Idempotency: skip if we already replied to this comment
-    me_resp = await _outline_api(client, "auth.info", {})
-    my_id = (((me_resp.get("data") or {}).get("user")) or {}).get("id", "")
-    if my_id and any(
-        c.get("parentCommentId") == comment_id
-        and (c.get("createdBy") or {}).get("id") == my_id
-        for c in comments
-    ):
-        return
-
-    thread = "\n".join(
-        f"{(c.get('createdBy') or {}).get('name', '?')}: {_pm_node_to_text(c.get('data') or {})}"
-        for c in sorted(comments, key=lambda c: c.get("createdAt", ""))
+async def _enqueue_mention(client: httpx.AsyncClient, **fields) -> str:
+    """Insert a queue row. Returns the new row id, or "exists" if this comment_id is
+    already queued (durable dedup via the unique index). Raises on any other failure."""
+    token = await _utilpb_token(client)
+    rec = {"status": "new", "attempt_count": 0, **fields}
+    r = await client.post(
+        f"{UTIL_PB_URL}/api/collections/outline_mentions/records",
+        json=rec, headers={"Authorization": token},
+        timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
     )
-    reply = await _generate_mention_reply(
-        client, doc.get("title", "(untitled)"), doc.get("text", ""), thread, mention_text,
+    if r.status_code in (200, 201):
+        return r.json()["id"]
+    # The unique partial index on comment_id reports this exact code on a duplicate.
+    if r.status_code == 400 and "validation_not_unique" in r.text:
+        return "exists"
+    r.raise_for_status()
+    raise RuntimeError(f"enqueue failed: {r.status_code} {r.text[:200]}")
+
+
+async def _patch_row(client: httpx.AsyncClient, row_id: str, fields: dict) -> None:
+    token = await _utilpb_token(client)
+    await client.patch(
+        f"{UTIL_PB_URL}/api/collections/outline_mentions/records/{row_id}",
+        json=fields, headers={"Authorization": token},
+        timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
     )
-    if reply:
-        await _outline_api(client, "comments.create", {
-            "documentId": doc_id,
-            "parentCommentId": parent_id,
-            "text": reply,
-        })
-        logger.info(
-            "Outline comment mention answered",
-            extra={"event": "outline_mention_answered", "comment_id": comment_id, "asker": asker},
-        )
 
 
-async def _reply_to_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
-    doc_resp = await _outline_api(client, "documents.info", {"id": doc_id})
-    doc = doc_resp.get("data") or {}
+async def _post_ack(client: httpx.AsyncClient, doc_id: str, parent_id: str) -> str:
+    """Post the instant 'working on it' ack as CroquetClaude. Returns its comment id."""
+    payload = {"documentId": doc_id, "text": _ACK_TEXT}
+    if parent_id:
+        payload["parentCommentId"] = parent_id
+    resp = await _outline_api(client, "comments.create", payload)
+    return ((resp.get("data") or {}).get("id")) or ""
 
-    # documents.info returns the ProseMirror data field — captures native @mention nodes
-    # that the Markdown text field omits.
+
+async def _ack_and_patch(client: httpx.AsyncClient, row_id: str, doc_id: str, parent_id: str) -> None:
+    """Post the ack and record its id on the row. An ack failure is non-fatal — the row is
+    already queued, so the worker will still answer (threaded under the mention's parent)."""
+    try:
+        ack_id = await _post_ack(client, doc_id, parent_id)
+        if ack_id:
+            await _patch_row(client, row_id, {"ack_comment_id": ack_id})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Outline ack post failed (row queued anyway)",
+                       extra={"event": "outline_ack_failed", "row": row_id, "exc": str(exc)})
+
+
+async def _handle_comment_mention(client: httpx.AsyncClient, data: dict) -> None:
+    """Enqueue a comment @mention for the local worker, then post the instant ack."""
+    comment_id = data.get("id", "")
+    doc_id = data.get("documentId", "")
+    parent_id = data.get("parentCommentId") or comment_id  # thread root
+    asker = (data.get("createdBy") or {}).get("name", "a committee member")
+    text = _pm_node_to_text(data.get("data") or {})
+
+    res = await _enqueue_mention(
+        client, comment_id=comment_id, doc_id=doc_id, source="comment",
+        parent_comment_id=parent_id, mention_text=text, asker=asker,
+    )
+    if res == "exists":
+        return  # already queued — no second ack
+    logger.info("Outline comment mention queued",
+                extra={"event": "outline_mention_queued", "comment_id": comment_id, "row": res})
+    await _ack_and_patch(client, res, doc_id, parent_id)
+
+
+async def _handle_doc_mention(client: httpx.AsyncClient, doc: dict) -> None:
+    """Enqueue a document-body @mention. The documents.update payload IS the doc object
+    (id, title, url, ProseMirror data)."""
+    doc_id = doc.get("id", "")
     body_text = _pm_node_to_text(doc.get("data") or {})
     if not _MENTION_RE_OL.search(body_text):
         return
-
     lines = [ln.strip() for ln in body_text.splitlines() if ln.strip() and _MENTION_RE_OL.search(ln)]
     if not lines:
         return
-
-    mention_key = f"body:{doc_id}:{hashlib.sha1(lines[0].encode()).hexdigest()[:16]}"
-    if mention_key in _webhook_seen:
+    line = lines[0]
+    # Synthetic comment_id so the unique-index dedup covers body mentions too.
+    comment_id = f"body:{doc_id}:{hashlib.sha1(line.encode()).hexdigest()[:16]}"
+    if comment_id in _webhook_seen:
         return
+    _webhook_seen.add(comment_id)
 
-    comments_resp = await _outline_api(client, "comments.list", {"documentId": doc_id, "limit": 50})
-    comments = comments_resp.get("data") or []
-    me_resp = await _outline_api(client, "auth.info", {})
-    my_id = (((me_resp.get("data") or {}).get("user")) or {}).get("id", "")
-
-    # Idempotency: skip if we already left a comment quoting this mention line
-    if my_id and any(
-        lines[0] in _pm_node_to_text(c.get("data") or {})
-        and (c.get("createdBy") or {}).get("id") == my_id
-        for c in comments
-    ):
-        _webhook_seen.add(mention_key)
-        return
-
-    _webhook_seen.add(mention_key)
-    thread = "\n".join(
-        f"{(c.get('createdBy') or {}).get('name', '?')}: {_pm_node_to_text(c.get('data') or {})}"
-        for c in sorted(comments, key=lambda c: c.get("createdAt", ""))
-    )
-    reply = await _generate_mention_reply(
-        client, doc.get("title", "(untitled)"), doc.get("text", ""), thread, lines[0],
-    )
-    if reply:
-        await _outline_api(client, "comments.create", {
-            "documentId": doc_id,
-            "text": f"> {lines[0]}\n\n{reply}",
-        })
-        logger.info(
-            "Outline doc mention answered",
-            extra={"event": "outline_doc_mention_answered", "doc_id": doc_id},
+    doc_url = f"https://docs.croquetclaude.com{doc.get('url', '')}" if doc.get("url") else ""
+    try:
+        res = await _enqueue_mention(
+            client, comment_id=comment_id, doc_id=doc_id, source="document",
+            parent_comment_id="", mention_text=line, asker="a committee member",
+            doc_title=doc.get("title", ""), doc_url=doc_url,
         )
+    except Exception:
+        _webhook_seen.discard(comment_id)  # let an Outline retry re-run (mirror the comment path)
+        raise
+    if res == "exists":
+        return
+    logger.info("Outline doc mention queued",
+                extra={"event": "outline_doc_mention_queued", "doc_id": doc_id, "row": res})
+    await _ack_and_patch(client, res, doc_id, parent_id="")  # top-level ack for body mentions
 
 
 @app.post("/outline/webhook")
@@ -1049,12 +1047,11 @@ async def outline_webhook(request: Request):
         text = _pm_node_to_text(data.get("data") or {})
         if _MENTION_RE_OL.search(text):
             _webhook_seen.add(comment_id)
-            doc_id = data.get("documentId", "")
-            parent_id = data.get("parentCommentId") or comment_id
-            asker = (data.get("createdBy") or {}).get("name", "a committee member")
             try:
-                await _reply_to_comment_mention(client, doc_id, comment_id, parent_id, text, asker)
+                await _handle_comment_mention(client, data)
             except Exception as exc:
+                # Enqueue failed (e.g. util PB unreachable). By design we post NO ack we
+                # can't fulfil; drop the in-process flag so an Outline retry can succeed.
                 logger.error(
                     "Outline comment webhook error",
                     extra={"event": "outline_webhook_error", "exc": str(exc)},
@@ -1062,10 +1059,10 @@ async def outline_webhook(request: Request):
                 _webhook_seen.discard(comment_id)
 
     elif event == "documents.update":
-        doc_id = data.get("id", "")
-        if doc_id:
+        doc = data  # the documents.update payload is the doc object
+        if doc.get("id"):
             try:
-                await _reply_to_doc_mention(client, doc_id)
+                await _handle_doc_mention(client, doc)
             except Exception as exc:
                 logger.error(
                     "Outline doc webhook error",
