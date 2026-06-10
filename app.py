@@ -149,6 +149,9 @@ MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", "8192"))
 OUTLINE_WEBHOOK_SECRET = os.environ.get("OUTLINE_WEBHOOK_SECRET", "")
 OUTLINE_API_TOKEN = os.environ.get("OUTLINE_API_TOKEN", "")
 OUTLINE_API_BASE = os.environ.get("OUTLINE_API_BASE", "https://docs.croquetclaude.com/api")
+# CroquetClaude's own Outline user id — the self-filter that stops a no-@ follow-up pickup from
+# ever re-triggering on a comment WE posted (the reply-loop breaker, Feature 2.8).
+CROQUETCLAUDE_USER_ID = os.environ.get("CROQUETCLAUDE_USER_ID", "60ee9481-714c-4e65-a50b-70de0f4ff438")
 
 # util PocketBase queue (reachable from Sydney + Wade's machine)
 UTIL_PB_URL = os.environ.get("UTIL_PB_URL", "https://util.croquetwade.com")
@@ -931,11 +934,12 @@ async def _enqueue_mention(client: httpx.AsyncClient, **fields) -> str:
 
 async def _patch_row(client: httpx.AsyncClient, row_id: str, fields: dict) -> None:
     token = await _utilpb_token(client)
-    await client.patch(
+    r = await client.patch(
         f"{UTIL_PB_URL}/api/collections/outline_mentions/records/{row_id}",
         json=fields, headers={"Authorization": token},
         timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
     )
+    r.raise_for_status()  # surface a failed patch (e.g. lost ack_comment_id) to the caller's logger
 
 
 async def _post_ack(client: httpx.AsyncClient, doc_id: str, parent_id: str) -> str:
@@ -957,6 +961,88 @@ async def _ack_and_patch(client: httpx.AsyncClient, row_id: str, doc_id: str, pa
     except Exception as exc:  # noqa: BLE001
         logger.warning("Outline ack post failed (row queued anyway)",
                        extra={"event": "outline_ack_failed", "row": row_id, "exc": str(exc)})
+
+
+async def _find_row_by_parent(client: httpx.AsyncClient, parent_id: str) -> dict | None:
+    """Find the queue row for the thread a reply belongs to (Feature 2.8 follow-ups).
+
+    Outline threads are flat: a reply's parentCommentId is the THREAD ROOT (the original
+    @mention comment), not the specific CroquetClaude comment it sits under. So a reply's
+    parent matches the original mention row's `comment_id`. We also match `ack_comment_id`
+    / `answer_comment_id` defensively (in case a client ever parents to CC's comment directly,
+    and because answer_comment_id is not always written back)."""
+    if not parent_id:
+        return None
+    token = await _utilpb_token(client)
+    flt = (f'(comment_id="{parent_id}" || ack_comment_id="{parent_id}" '
+           f'|| answer_comment_id="{parent_id}")')
+    r = await client.get(
+        f"{UTIL_PB_URL}/api/collections/outline_mentions/records",
+        params={"filter": flt, "perPage": 1},
+        headers={"Authorization": token},
+        timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
+    )
+    if r.status_code != 200:
+        return None
+    items = (r.json() or {}).get("items") or []
+    return items[0] if items else None
+
+
+async def _cc_was_last_in_thread(client: httpx.AsyncClient, doc_id: str,
+                                 thread_root: str, this_comment_id: str) -> bool:
+    """True if CroquetClaude posted the most recent comment in this thread before `this_comment_id`.
+
+    This is the "don't be rude" guard: we only answer a no-@ reply when it is genuinely a reply
+    TO CroquetClaude (CC spoke last), not when committee members are talking among themselves in
+    a thread that merely started with a question to CC. Fails safe to False on any error."""
+    if not doc_id or not thread_root:
+        return False
+    try:
+        resp = await _outline_api(client, "comments.list", {"documentId": doc_id, "limit": 100})
+    except Exception:
+        return False
+    comments = resp.get("data") or []
+    # The thread = the root comment itself plus everything parented to it (flat threading).
+    thread = [c for c in comments
+              if c.get("id") == thread_root or (c.get("parentCommentId") or "") == thread_root]
+    # Exclude the triggering reply — we want who spoke last BEFORE it.
+    thread = [c for c in thread if c.get("id") != this_comment_id]
+    if not thread:
+        return False
+    thread.sort(key=lambda c: c.get("createdAt") or "", reverse=True)
+    last = thread[0]
+    author_id = (last.get("createdBy") or {}).get("id") or last.get("createdById") or ""
+    return author_id == CROQUETCLAUDE_USER_ID
+
+
+async def _handle_followup(client: httpx.AsyncClient, model: dict) -> bool:
+    """A no-@ reply in a thread CroquetClaude is in -> enqueue it as a follow-up + ack, but only
+    when CroquetClaude was the last to speak (a genuine reply to it). Returns True if handled as a
+    follow-up, False if it's just a normal committee comment. The caller has already applied the
+    self-filter, so this is never one of our own comments."""
+    parent_id = model.get("parentCommentId") or ""
+    row = await _find_row_by_parent(client, parent_id)
+    if not row:
+        return False
+    comment_id = model.get("id", "")
+    doc_id = model.get("documentId", "") or row.get("doc_id", "")
+    # Only chime in when CC posted the most recent comment in the thread — i.e. this is a reply TO
+    # CroquetClaude, not committee members chatting. Without this, every reply in the thread answers.
+    if not await _cc_was_last_in_thread(client, doc_id, parent_id, comment_id):
+        return False
+    asker = (model.get("createdBy") or {}).get("name", "a committee member")
+    text = _pm_node_to_text(model.get("data") or {})
+    res = await _enqueue_mention(
+        client, comment_id=comment_id, doc_id=doc_id, source="comment",
+        parent_comment_id=parent_id, mention_text=text, asker=asker,
+        doc_title=row.get("doc_title", ""), doc_url=row.get("doc_url", ""),
+    )
+    if res == "exists":
+        return True  # already queued — no second ack
+    logger.info("Outline follow-up (no @) queued",
+                extra={"event": "outline_followup_queued", "comment_id": comment_id, "row": res})
+    await _ack_and_patch(client, res, doc_id, parent_id)
+    return True
 
 
 async def _handle_comment_mention(client: httpx.AsyncClient, data: dict) -> None:
@@ -1077,6 +1163,12 @@ async def outline_webhook(request: Request):
         comment_id = model.get("id", "")
         if not comment_id or comment_id in _webhook_seen:
             return {"ok": True}
+        # Self-filter FIRST, for BOTH branches: never act on a comment CroquetClaude posted. This is
+        # the reply-loop breaker — without it, an answer that merely quotes "@croquetclaude" would
+        # re-enqueue itself via the @-branch and the bot would answer its own answer.
+        author_id = (model.get("createdBy") or {}).get("id") or model.get("createdById") or ""
+        if author_id and author_id == CROQUETCLAUDE_USER_ID:
+            return {"ok": True}
         text = _pm_node_to_text(model.get("data") or {})
         if _MENTION_RE_OL.search(text):
             _webhook_seen.add(comment_id)
@@ -1087,6 +1179,23 @@ async def outline_webhook(request: Request):
                 # can't fulfil; drop the in-process flag so an Outline retry can succeed.
                 logger.error(
                     "Outline comment webhook error",
+                    extra={"event": "outline_webhook_error", "exc": str(exc)},
+                )
+                _webhook_seen.discard(comment_id)
+        else:
+            # No @ — people forget to @ when replying in a thread. If this is a direct reply to a
+            # CroquetClaude comment, pick it up as a follow-up (Feature 2.8). The CC self-filter is
+            # already applied above; here we additionally require a KNOWN author and fail safe if it
+            # is absent (better to miss a follow-up than risk acting on an unattributable comment).
+            if not author_id:
+                return {"ok": True}
+            _webhook_seen.add(comment_id)
+            try:
+                if not await _handle_followup(client, model):
+                    _webhook_seen.discard(comment_id)  # not a follow-up; a normal committee comment
+            except Exception as exc:
+                logger.error(
+                    "Outline follow-up webhook error",
                     extra={"event": "outline_webhook_error", "exc": str(exc)},
                 )
                 _webhook_seen.discard(comment_id)
