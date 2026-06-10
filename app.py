@@ -849,8 +849,7 @@ _webhook_seen: set[str] = set()  # in-process fast dedup; the durable dedup is t
 
 # Canned instant acknowledgement (no LLM). CroquetClaude voice, AU English, no em-dashes.
 _ACK_TEXT = (
-    "G'day, CroquetClaude here. I've got your question and I'm looking into it now. "
-    "I'll pop the answer right here shortly."
+    "⏳ Got your message — it's in the queue. I'll bring the answer back right here."
 )
 
 
