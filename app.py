@@ -845,7 +845,24 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
 # ---------------------------------------------------------------------------
 
 _MENTION_RE_OL = re.compile(r"(?<!\w)@croquetclaude\b", re.I)
+# A native @mention NODE (what the autocomplete inserts) is NOT literal "@croquetclaude" text. In the
+# markdown export it is @[Label](mention://<workspace>/user/<userId>), and documents.info returns this
+# markdown `text` (NOT the ProseMirror `data`), so a body @mention is detected by CroquetClaude's user
+# id appearing in a mention:// URL. (Comment payloads do carry `data`, so the comment path is fine.)
+_MENTION_NODE_RE = re.compile(r"mention://[^\s)]*?/user/" + re.escape(CROQUETCLAUDE_USER_ID), re.I)
+_MENTION_MD_RE = re.compile(r"@\[([^\]]+)\]\(mention://[^)]+\)")  # @[Name](mention://...) -> @Name
 _webhook_seen: set[str] = set()  # in-process fast dedup; the durable dedup is the util PB unique comment_id
+
+
+def _is_cc_mention(s: str) -> bool:
+    """True if the text mentions CroquetClaude either as literal @croquetclaude or a native @mention
+    node (markdown @[..](mention://.../user/<cc id>))."""
+    return bool(_MENTION_RE_OL.search(s or "") or _MENTION_NODE_RE.search(s or ""))
+
+
+def _clean_mention_md(text: str) -> str:
+    """Turn a markdown @mention node @[Label](mention://...) into a plain @Label for the queued text."""
+    return _MENTION_MD_RE.sub(r"@\1", text or "")
 
 # Canned instant acknowledgement (no LLM). CroquetClaude voice, AU English, no em-dashes.
 _ACK_TEXT = (
@@ -1071,13 +1088,16 @@ async def _handle_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
         return
     resp = await _outline_api(client, "documents.info", {"id": doc_id})
     doc = resp.get("data") or {}
-    body_text = _pm_node_to_text(doc.get("data") or {})
-    if not _MENTION_RE_OL.search(body_text):
+    # documents.info returns the markdown `text` (NOT the ProseMirror `data`), so detect from the
+    # markdown: literal @croquetclaude OR a native @mention node to CC's user id. Fall back to the
+    # ProseMirror data if a future Outline version provides it.
+    body_text = doc.get("text") or _pm_node_to_text(doc.get("data") or {})
+    if not _is_cc_mention(body_text):
         return
-    lines = [ln.strip() for ln in body_text.splitlines() if ln.strip() and _MENTION_RE_OL.search(ln)]
+    lines = [ln.strip() for ln in body_text.splitlines() if ln.strip() and _is_cc_mention(ln)]
     if not lines:
         return
-    line = lines[0]
+    line = _clean_mention_md(lines[0])
     # Synthetic comment_id so the unique-index dedup covers body mentions too.
     comment_id = f"body:{doc_id}:{hashlib.sha1(line.encode()).hexdigest()[:16]}"
     if comment_id in _webhook_seen:
