@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -853,6 +854,15 @@ _MENTION_NODE_RE = re.compile(r"mention://[^\s)]*?/user/" + re.escape(CROQUETCLA
 _MENTION_MD_RE = re.compile(r"@\[([^\]]+)\]\(mention://[^)]+\)")  # @[Name](mention://...) -> @Name
 _webhook_seen: set[str] = set()  # in-process fast dedup; the durable dedup is the util PB unique comment_id
 
+# Debounce for document-body mentions (live incident 2026-06-11): Outline AUTOSAVES every few
+# seconds while someone types, and every save is a documents.update event carrying a longer
+# half-typed snapshot of the sentence — four acks and an answer to "can you get d" before the ask
+# was even finished. Each new save for a doc resets its timer; only DOC_MENTION_DEBOUNCE_S after
+# the LAST save do we read the doc fresh and enqueue the settled line. In-memory (a restart
+# mid-window drops that one timer — the member just edits the line again).
+DOC_MENTION_DEBOUNCE_S = int(os.environ.get("DOC_MENTION_DEBOUNCE_S", "60"))
+_doc_debounce: dict[str, "asyncio.Task"] = {}
+
 
 def _is_cc_mention(s: str) -> bool:
     """True if the text mentions CroquetClaude either as literal @croquetclaude or a native @mention
@@ -1080,21 +1090,20 @@ async def _handle_comment_mention(client: httpx.AsyncClient, data: dict) -> None
     await _ack_and_patch(client, res, doc_id, parent_id)
 
 
-async def _handle_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
-    """Enqueue a document-body @mention. Fetch documents.info for the ProseMirror `data`
-    (the webhook's documents.update model isn't guaranteed to carry it; native @mention
-    nodes are not in the Markdown text export)."""
+async def _handle_doc_mention(client: httpx.AsyncClient, doc_id: str, asker: str = "") -> None:
+    """Enqueue a document-body @mention, reading the doc FRESH (the debounce means the sentence has
+    settled by now). Body detection is NODE-ONLY (`mention://.../user/<cc id>` — what the
+    autocomplete inserts): literal "@croquetclaude" text in a page body no longer triggers, because
+    our own guide and tour pages quote that text as examples and answered themselves when created
+    (2026-06-11). Comments keep the literal-text trigger."""
     if not doc_id:
         return
     resp = await _outline_api(client, "documents.info", {"id": doc_id})
     doc = resp.get("data") or {}
-    # documents.info returns the markdown `text` (NOT the ProseMirror `data`), so detect from the
-    # markdown: literal @croquetclaude OR a native @mention node to CC's user id. Fall back to the
-    # ProseMirror data if a future Outline version provides it.
     body_text = doc.get("text") or _pm_node_to_text(doc.get("data") or {})
-    if not _is_cc_mention(body_text):
+    if not _MENTION_NODE_RE.search(body_text):
         return
-    lines = [ln.strip() for ln in body_text.splitlines() if ln.strip() and _is_cc_mention(ln)]
+    lines = [ln.strip() for ln in body_text.splitlines() if ln.strip() and _MENTION_NODE_RE.search(ln)]
     if not lines:
         return
     line = _clean_mention_md(lines[0])
@@ -1108,7 +1117,7 @@ async def _handle_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
     try:
         res = await _enqueue_mention(
             client, comment_id=comment_id, doc_id=doc_id, source="document",
-            parent_comment_id="", mention_text=line, asker="a committee member",
+            parent_comment_id="", mention_text=line, asker=asker or "a committee member",
             doc_title=doc.get("title", ""), doc_url=doc_url,
         )
     except Exception:
@@ -1119,6 +1128,38 @@ async def _handle_doc_mention(client: httpx.AsyncClient, doc_id: str) -> None:
     logger.info("Outline doc mention queued",
                 extra={"event": "outline_doc_mention_queued", "doc_id": doc_id, "row": res})
     await _ack_and_patch(client, res, doc_id, parent_id="")  # top-level ack for body mentions
+
+
+async def _debounced_doc_mention(client: httpx.AsyncClient, doc_id: str, actor_id: str) -> None:
+    """Wait out the autosave storm, then resolve the actor's name (asker register) and handle the
+    settled mention. Cancellation = a newer save superseded this timer; the new task owns the doc."""
+    try:
+        await asyncio.sleep(DOC_MENTION_DEBOUNCE_S)
+        asker = ""
+        if actor_id:
+            try:
+                u = await _outline_api(client, "users.info", {"id": actor_id})
+                asker = (u.get("data") or {}).get("name") or ""
+            except Exception:  # noqa: BLE001 — the name is a nicety, never block the mention
+                asker = ""
+        await _handle_doc_mention(client, doc_id, asker=asker)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001 — log like the old inline path did
+        logger.error("Outline doc webhook error (debounced)",
+                     extra={"event": "outline_webhook_error", "exc": str(exc)})
+    finally:
+        if _doc_debounce.get(doc_id) is asyncio.current_task():
+            _doc_debounce.pop(doc_id, None)
+
+
+def _schedule_doc_mention(client: httpx.AsyncClient, doc_id: str, actor_id: str) -> None:
+    """Debounce documents.update per doc: each new save cancels the pending timer and starts a
+    fresh one, so the mention is enqueued exactly once, DOC_MENTION_DEBOUNCE_S after typing stops."""
+    old = _doc_debounce.get(doc_id)
+    if old and not old.done():
+        old.cancel()
+    _doc_debounce[doc_id] = asyncio.create_task(_debounced_doc_mention(client, doc_id, actor_id))
 
 
 def _verify_outline_sig(body: bytes, headers) -> bool:
@@ -1221,13 +1262,11 @@ async def outline_webhook(request: Request):
 
     elif event == "documents.update":
         doc_id = model.get("id", "")
-        if doc_id:
-            try:
-                await _handle_doc_mention(client, doc_id)
-            except Exception as exc:
-                logger.error(
-                    "Outline doc webhook error",
-                    extra={"event": "outline_webhook_error", "exc": str(exc)},
-                )
+        actor_id = payload.get("actorId") or ""
+        # CroquetClaude's own page writes (proposal blocks, accept/subpage swaps, doc updates via
+        # the API) must never trigger the mention path — the tour pages answered their own example
+        # text when created (2026-06-11). Humans (or an absent actorId) proceed to the debounce.
+        if doc_id and actor_id != CROQUETCLAUDE_USER_ID:
+            _schedule_doc_mention(client, doc_id, actor_id)
 
     return {"ok": True}
