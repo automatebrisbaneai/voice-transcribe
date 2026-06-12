@@ -1162,6 +1162,86 @@ def _schedule_doc_mention(client: httpx.AsyncClient, doc_id: str, actor_id: str)
     _doc_debounce[doc_id] = asyncio.create_task(_debounced_doc_mention(client, doc_id, actor_id))
 
 
+async def _handle_collection_mention(client: httpx.AsyncClient, col_id: str, asker: str = "") -> None:
+    """A mention typed into a COLLECTION's cover text (its description). Found live 2026-06-12:
+    Wade asked there and nothing answered — covers fire collections.update, which we'd never
+    subscribed to, and they have no comment threads of their own. The answer surface is the
+    collection's first page (its hub), with the cover ask quoted so the thread makes sense."""
+    if not col_id:
+        return
+    info = await _outline_api(client, "collections.info", {"id": col_id})
+    col = info.get("data") or {}
+    desc = col.get("description") or ""
+    if not _MENTION_NODE_RE.search(desc):
+        return
+    lines = [ln.strip() for ln in desc.splitlines() if ln.strip() and _MENTION_NODE_RE.search(ln)]
+    if not lines:
+        return
+    line = _clean_mention_md(lines[0])
+    comment_id = f"coldesc:{col_id}:{hashlib.sha1(line.encode()).hexdigest()[:16]}"
+    if comment_id in _webhook_seen:
+        return
+    _webhook_seen.add(comment_id)
+
+    # anchor the conversation on the collection's first page (covers can't hold comments)
+    try:
+        tree = await _outline_api(client, "collections.documents", {"id": col_id})
+        anchor = ((tree.get("data") or [{}])[0]) or {}
+    except Exception:
+        anchor = {}
+    anchor_id = anchor.get("id") or ""
+    if not anchor_id:
+        logger.warning("collection cover mention but the collection has no pages to answer on",
+                       extra={"event": "outline_coldesc_no_anchor", "collection": col_id})
+        _webhook_seen.discard(comment_id)
+        return
+    mention_text = f"[asked on the '{col.get('name', 'collection')}' collection cover] {line}"
+    try:
+        res = await _enqueue_mention(
+            client, comment_id=comment_id, doc_id=anchor_id, source="document",
+            parent_comment_id="", mention_text=mention_text, asker=asker or "a committee member",
+            doc_title=anchor.get("title", ""), doc_url="",
+        )
+    except Exception:
+        _webhook_seen.discard(comment_id)
+        raise
+    if res == "exists":
+        return
+    logger.info("Outline collection-cover mention queued",
+                extra={"event": "outline_coldesc_mention_queued", "collection": col_id, "row": res})
+    await _ack_and_patch(client, res, anchor_id, parent_id="")
+
+
+async def _debounced_collection_mention(client: httpx.AsyncClient, col_id: str, actor_id: str) -> None:
+    """Same debounce shape as documents: wait out the autosave storm, resolve the asker, handle."""
+    try:
+        await asyncio.sleep(DOC_MENTION_DEBOUNCE_S)
+        asker = ""
+        if actor_id:
+            try:
+                u = await _outline_api(client, "users.info", {"id": actor_id})
+                asker = (u.get("data") or {}).get("name") or ""
+            except Exception:  # noqa: BLE001
+                asker = ""
+        await _handle_collection_mention(client, col_id, asker=asker)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Outline collection webhook error (debounced)",
+                     extra={"event": "outline_webhook_error", "exc": str(exc)})
+    finally:
+        if _doc_debounce.get(f"col:{col_id}") is asyncio.current_task():
+            _doc_debounce.pop(f"col:{col_id}", None)
+
+
+def _schedule_collection_mention(client: httpx.AsyncClient, col_id: str, actor_id: str) -> None:
+    key = f"col:{col_id}"
+    old = _doc_debounce.get(key)
+    if old and not old.done():
+        old.cancel()
+    _doc_debounce[key] = asyncio.create_task(_debounced_collection_mention(client, col_id, actor_id))
+
+
 def _verify_outline_sig(body: bytes, headers) -> bool:
     """Verify an Outline webhook signature.
 
@@ -1268,5 +1348,11 @@ async def outline_webhook(request: Request):
         # text when created (2026-06-11). Humans (or an absent actorId) proceed to the debounce.
         if doc_id and actor_id != CROQUETCLAUDE_USER_ID:
             _schedule_doc_mention(client, doc_id, actor_id)
+
+    elif event == "collections.update":
+        col_id = model.get("id", "")
+        actor_id = payload.get("actorId") or ""
+        if col_id and actor_id != CROQUETCLAUDE_USER_ID:
+            _schedule_collection_mention(client, col_id, actor_id)
 
     return {"ok": True}
