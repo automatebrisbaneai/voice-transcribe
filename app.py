@@ -106,6 +106,15 @@ async def lifespan(application: FastAPI):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 OPENCODE_GO_KEY = os.environ.get("OPENCODE_GO_KEY", "")
+# Auto-rotation: /clean tries each key in order and skips any that has hit its
+# monthly cap (HTTP 429 / GoUsageLimitError). A single capped key took voice
+# cleanup down site-wide on 2026-06-21 because there was no fallback. Set
+# OPENCODE_GO_KEYS to a comma-separated list to enable rotation; otherwise it
+# falls back to the single OPENCODE_GO_KEY.
+_keys_env = os.environ.get("OPENCODE_GO_KEYS", "").strip()
+OPENCODE_GO_KEYS = [k.strip() for k in _keys_env.split(",") if k.strip()] or (
+    [OPENCODE_GO_KEY] if OPENCODE_GO_KEY else []
+)
 MODEL = "deepseek-v4-flash"  # OpenCode Go bare slug
 OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 
@@ -725,40 +734,73 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
 
     try:
         t_or_start = time.monotonic()
-        res = await client.post(
-            OPENCODE_GO_URL,
-            headers={
-                "Authorization": f"Bearer {OPENCODE_GO_KEY}",
-                "Content-Type": "application/json",
-                "User-Agent": "croquetwade-worker/1.0",
-            },
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": normalized},
-                ],
-                # DeepSeek V4 on OpenCode burns substantial hidden reasoning tokens
-                # against max_tokens (OR's reasoning={"effort":"none"} extension is
-                # silently ignored). 500-token floor was too tight — reasoning ate
-                # every token, content came back empty. 4096 covers reasoning + actual
-                # cleaned output even for the longest practical transcripts.
-                "max_tokens": 4096,
-            },
-        )
-        or_duration_ms = round((time.monotonic() - t_or_start) * 1000)
-        data = res.json()
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": normalized},
+            ],
+            # DeepSeek V4 on OpenCode burns substantial hidden reasoning tokens
+            # against max_tokens (OR's reasoning={"effort":"none"} extension is
+            # silently ignored). 500-token floor was too tight — reasoning ate
+            # every token, content came back empty. 4096 covers reasoning + actual
+            # cleaned output even for the longest practical transcripts.
+            "max_tokens": 4096,
+        }
 
-        if "choices" not in data:
+        # Auto-rotation across OPENCODE_GO_KEYS: try each key, skip any that is
+        # capped (429 / GoUsageLimitError) or errors, fall through to the next.
+        data = None
+        res = None
+        last_status = None
+        last_body = None
+        for key_idx, key in enumerate(OPENCODE_GO_KEYS):
+            res = await client.post(
+                OPENCODE_GO_URL,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "croquetwade-worker/1.0",
+                },
+                json=payload,
+            )
+            last_status = res.status_code
+            try:
+                body = res.json()
+            except ValueError:
+                body = {}
+            if res.status_code == 200 and isinstance(body, dict) and "choices" in body:
+                data = body
+                if key_idx > 0:
+                    logger.info(
+                        "OpenCode key rotated to a working key",
+                        extra={"event": "clean_key_rotated", "key_index": key_idx},
+                    )
+                break
+            capped = res.status_code == 429 or "limit" in str(body).lower()
+            logger.warning(
+                "OpenCode key unavailable — rotating to next",
+                extra={
+                    "event": "clean_key_skip",
+                    "key_index": key_idx,
+                    "status_code": res.status_code,
+                    "capped": capped,
+                    "client_ip": client_ip,
+                },
+            )
+            last_body = body
+        or_duration_ms = round((time.monotonic() - t_or_start) * 1000)
+
+        if data is None:
             logger.error(
-                "Upstream LLM returned error response",
+                "Upstream LLM error — all OpenCode keys exhausted",
                 extra={
                     "event": "upstream_clean",
-                    "status_code": res.status_code,
+                    "status_code": last_status,
                     "duration_ms": or_duration_ms,
                     "input_chars": input_chars,
                     "output_chars": 0,
-                    "error": str(data),
+                    "error": str(last_body),
                     "client_ip": client_ip,
                 },
             )
@@ -768,7 +810,7 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
                 extra={
                     "event": "clean_failure",
                     "duration_ms": duration_ms,
-                    "failure_reason": "upstream_error",
+                    "failure_reason": "upstream_error_all_keys",
                 },
             )
             raise HTTPException(status_code=502, detail="Transcript cleaning failed, please try again.")
